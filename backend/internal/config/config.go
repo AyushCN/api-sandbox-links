@@ -61,6 +61,19 @@ type Config struct {
 	// MaxLifetimeSeconds caps how far expires_at may be extended from original
 	// creation (default 7 days).
 	MaxLifetimeSeconds int64
+
+	// MaxActiveSandboxesPerUser caps how many sandboxes one user may keep
+	// concurrently alive (rows with destroyed_at NULL). Creation past the cap
+	// is refused with 409 before any build starts; destroying or expiring a
+	// sandbox releases its slot. Enforced atomically in the database (see
+	// Store.CreateSandboxWithinQuota), so racing requests cannot overshoot.
+	MaxActiveSandboxesPerUser int
+	// MaxRunningSandboxes caps how many sandboxes may be live platform-wide,
+	// across every user. Default 6. It is enforced in the same atomic insert as
+	// the per-user quota (Store.CreateSandboxWithinLimits). A programmatically
+	// built Config with zero disables the cap (test harnesses); config.Load
+	// always sets a positive value.
+	MaxRunningSandboxes int
 }
 
 // Load reads .env (if present) and the process environment, then parses it
@@ -71,21 +84,23 @@ func Load() (*Config, error) {
 	_ = godotenv.Load()
 
 	cfg := &Config{
-		DatabaseURL:          os.Getenv("DATABASE_URL"),
-		RedisURL:             os.Getenv("REDIS_URL"),
-		GitHubClientID:       os.Getenv("GITHUB_CLIENT_ID"),
-		GitHubClientSecret:   os.Getenv("GITHUB_CLIENT_SECRET"),
-		GitHubOAuthCallbackURL: os.Getenv("GITHUB_OAUTH_CALLBACK_URL"),
-		GeminiAPIKey:          os.Getenv("GEMINI_API_KEY"),
-		DockerHost:            envDefault("DOCKER_HOST", "unix:///var/run/docker.sock"),
-		SandboxWorkDir:        envDefault("SANDBOX_WORK_DIR", "/tmp/api-sandbox-links/work"),
-		BackendPort:           envIntDefault("BACKEND_PORT", 8080),
-		GatewayPort:           envIntDefault("GATEWAY_PORT", 8090),
-		FrontendURL:           envDefault("FRONTEND_URL", "http://localhost:3000"),
-		SandboxBaseDomain:     envDefault("SANDBOX_BASE_DOMAIN", "sandbox.localhost"),
-		NixpacksBin:           envDefault("NIXPACKS_BIN", "nixpacks"),
-		MaxLifetimeSeconds:    envInt64Default("MAX_LIFETIME_SECONDS", 7*24*3600),
-		DevAuth:               os.Getenv("GITHUB_CLIENT_ID") == "",
+		DatabaseURL:               os.Getenv("DATABASE_URL"),
+		RedisURL:                  os.Getenv("REDIS_URL"),
+		GitHubClientID:            os.Getenv("GITHUB_CLIENT_ID"),
+		GitHubClientSecret:        os.Getenv("GITHUB_CLIENT_SECRET"),
+		GitHubOAuthCallbackURL:    os.Getenv("GITHUB_OAUTH_CALLBACK_URL"),
+		GeminiAPIKey:              os.Getenv("GEMINI_API_KEY"),
+		DockerHost:                envDefault("DOCKER_HOST", "unix:///var/run/docker.sock"),
+		SandboxWorkDir:            envDefault("SANDBOX_WORK_DIR", "/tmp/api-sandbox-links/work"),
+		BackendPort:               envIntDefault("BACKEND_PORT", 8080),
+		GatewayPort:               envIntDefault("GATEWAY_PORT", 8090),
+		FrontendURL:               envDefault("FRONTEND_URL", "http://localhost:3000"),
+		SandboxBaseDomain:         envDefault("SANDBOX_BASE_DOMAIN", "sandbox.localhost"),
+		NixpacksBin:               envDefault("NIXPACKS_BIN", "nixpacks"),
+		MaxLifetimeSeconds:        envInt64Default("MAX_LIFETIME_SECONDS", 7*24*3600),
+		MaxActiveSandboxesPerUser: envIntDefault("MAX_ACTIVE_SANDBOXES_PER_USER", 3),
+		MaxRunningSandboxes:       envIntDefault("MAX_RUNNING_SANDBOXES", 6),
+		DevAuth:                   os.Getenv("GITHUB_CLIENT_ID") == "",
 	}
 
 	if err := cfg.decryptKey(); err != nil {
@@ -97,6 +112,14 @@ func Load() (*Config, error) {
 	}
 	if len(cfg.EncryptionKey) == 0 {
 		return nil, fmt.Errorf("config: SECRETS_ENCRYPTION_KEY must be a base64-encoded 32-byte key")
+	}
+	// Abuse-control bounds: a zero or negative limit would either lock every
+	// user out (0) or disable the control entirely, so refuse to boot.
+	if cfg.MaxActiveSandboxesPerUser < 1 || cfg.MaxActiveSandboxesPerUser > 100 {
+		return nil, fmt.Errorf("config: MAX_ACTIVE_SANDBOXES_PER_USER must be between 1 and 100, got %d", cfg.MaxActiveSandboxesPerUser)
+	}
+	if cfg.MaxRunningSandboxes < 1 || cfg.MaxRunningSandboxes > 1000 {
+		return nil, fmt.Errorf("config: MAX_RUNNING_SANDBOXES must be between 1 and 1000, got %d", cfg.MaxRunningSandboxes)
 	}
 	return cfg, nil
 }

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -26,6 +27,11 @@ import (
 func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 	parent, ok := s.requireOwnedSandbox(w, r)
 	if !ok {
+		return
+	}
+	user, ok := s.userFrom(r)
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, "not signed in")
 		return
 	}
 	if parent.DestroyedAt != nil {
@@ -68,7 +74,16 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt:          now.Add(time.Duration(childLifetime) * time.Second),
 		CreatedAt:          now,
 	}
-	if err := s.store.CreateSandbox(child); err != nil {
+	if err := s.store.CreateSandboxWithinLimits(child, user.ID, s.maxActiveSandboxes(), s.maxRunningSandboxes()); err != nil {
+		if errors.Is(err, db.ErrSandboxQuotaExceeded) {
+			s.writeSandboxQuotaExceeded(w)
+			return
+		}
+		if errors.Is(err, db.ErrGlobalCapacityReached) {
+			s.writeGlobalCapacityExceeded(w)
+			return
+		}
+		s.logger.Warn("fork: creating child sandbox", slog.String("parent", parent.ID), slog.String("err", err.Error()))
 		writeErr(w, http.StatusInternalServerError, "could not create fork")
 		return
 	}
@@ -122,9 +137,21 @@ func (s *Server) forkDeploy(parentCtx context.Context, parent, child *db.Sandbox
 	}
 }
 
-// forkFailed marks the child sandbox failed so the UI shows a clear error.
+// forkFailed marks the child sandbox failed so the UI shows a clear error, and
+// reclaims anything the fork created before the failure (a sidecar copied from
+// the parent, its volume, the private network, or a partially built image).
+// Only the child is touched: every lookup is keyed by the child's sandbox-id
+// label.
 func (s *Server) forkFailed(ctx context.Context, child *db.Sandbox, cause error) {
 	s.logger.Warn("fork deploy failed", slog.String("sandbox", child.ID), slog.String("err", cause.Error()))
+	if s.orch != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := s.orch.TeardownSandbox(cleanupCtx, child); err != nil {
+			s.logger.Warn("fork: tearing down failed fork",
+				slog.String("sandbox", child.ID), slog.String("err", err.Error()))
+		}
+		cancel()
+	}
 	_ = s.store.UpdateSandbox(child.ID, map[string]any{
 		"status": string(db.StatusFailed),
 	})

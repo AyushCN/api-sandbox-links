@@ -25,10 +25,10 @@ const (
 	// MaxLifetimeSeconds caps the planned lifetime (default 7 days, overridable
 	// via MAX_LIFETIME_SECONDS).
 	MaxLifetimeSeconds = 7 * 24 * 3600
-	// MinLifetimeSeconds keeps test sandboxes possible while discouraging
-	// accidental instant-destroy setups. 5 minutes is enough to exercise the
-	// warning ladder end-to-end.
-	MinLifetimeSeconds = 5 * 60
+	// MinLifetimeSeconds keeps a sandbox alive long enough to be useful: the
+	// lifetime clock starts at first activation, so anything shorter would be
+	// spent largely on the build itself. One hour is the floor.
+	MinLifetimeSeconds = 60 * 60
 )
 
 // createSandboxRequest is the body of POST /api/sandboxes.
@@ -132,7 +132,15 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt:          now.Add(time.Duration(lifetime) * time.Second),
 		CreatedAt:          now,
 	}
-	if err := s.store.CreateSandbox(sandbox); err != nil {
+	if err := s.store.CreateSandboxWithinLimits(sandbox, user.ID, s.maxActiveSandboxes(), s.maxRunningSandboxes()); err != nil {
+		if errors.Is(err, db.ErrSandboxQuotaExceeded) {
+			s.writeSandboxQuotaExceeded(w)
+			return
+		}
+		if errors.Is(err, db.ErrGlobalCapacityReached) {
+			s.writeGlobalCapacityExceeded(w)
+			return
+		}
 		s.logger.Warn("sandbox create failed", slog.String("err", err.Error()))
 		writeErr(w, http.StatusInternalServerError, "could not create sandbox")
 		return

@@ -116,6 +116,77 @@ func (s *Store) CreateSandbox(sb *Sandbox) error {
 	return s.db.Create(sb).Error
 }
 
+// ErrSandboxQuotaExceeded is returned by CreateSandboxWithinQuota when the
+// owning user already has the maximum number of live sandboxes.
+var ErrSandboxQuotaExceeded = errors.New("db: user's active sandbox quota is exhausted")
+
+// ErrGlobalCapacityReached is returned when the platform-wide live-sandbox
+// cap is already full. It is distinct from a user's quota so the API can tell
+// a user to wait for somebody else's sandbox to expire instead of suggesting
+// they destroy one of their own.
+var ErrGlobalCapacityReached = errors.New("db: platform sandbox capacity is exhausted")
+
+// CreateSandboxWithinQuota creates a sandbox row only while the owning user
+// is below maxActive live sandboxes. It is CreateSandboxWithinLimits with no
+// platform-wide cap.
+func (s *Store) CreateSandboxWithinQuota(sb *Sandbox, ownerUserID string, maxActive int) error {
+	return s.CreateSandboxWithinLimits(sb, ownerUserID, maxActive, 0)
+}
+
+// CreateSandboxWithinLimits creates a sandbox row only while the owning user
+// is below maxActive live sandboxes and, when maxRunning > 0, the platform is
+// below maxRunning live sandboxes in total.
+//
+// The check-and-insert is atomic: per-user and global Postgres advisory locks
+// (transaction-scoped, released automatically on commit or rollback) serialize
+// the checks across concurrent requests and backend instances, so racing
+// creations can never overshoot either cap. The count uses the same tombstone
+// definition as the rest of the platform: sandboxes with destroyed_at set
+// (manual destroy or lifetime expiry) drop out immediately.
+func (s *Store) CreateSandboxWithinLimits(sb *Sandbox, ownerUserID string, maxActive, maxRunning int) error {
+	if sb.ID == "" {
+		sb.ID = newID()
+	}
+	sb.ExpiresAt = sb.CreatedAt.Add(time.Duration(sb.LifetimeSeconds) * time.Second)
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		// Advisory locks take an arbitrary bigint key; hashing the user ID
+		// yields a stable per-user key with a 64-bit keyspace.
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+			"sandbox-quota:"+ownerUserID).Error; err != nil {
+			return fmt.Errorf("db: acquiring sandbox quota lock: %w", err)
+		}
+		var active int64
+		if err := tx.Raw(`SELECT count(*) FROM sandboxes s
+			JOIN repositories r ON r.id = s.repository_id
+			WHERE r.user_id = ? AND s.destroyed_at IS NULL`, ownerUserID).Scan(&active).Error; err != nil {
+			return fmt.Errorf("db: counting active sandboxes: %w", err)
+		}
+		if active >= int64(maxActive) {
+			return ErrSandboxQuotaExceeded
+		}
+		if maxRunning > 0 {
+			// A single global lock serializes every creator, so the global
+			// count cannot race. It is taken after the per-user lock, and all
+			// creators use the same order, so there is no deadlock cycle.
+			if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+				"sandbox-global-capacity").Error; err != nil {
+				return fmt.Errorf("db: acquiring global sandbox capacity lock: %w", err)
+			}
+			var running int64
+			if err := tx.Raw(`SELECT count(*) FROM sandboxes WHERE destroyed_at IS NULL`).Scan(&running).Error; err != nil {
+				return fmt.Errorf("db: counting live sandboxes: %w", err)
+			}
+			if running >= int64(maxRunning) {
+				return ErrGlobalCapacityReached
+			}
+		}
+		if err := tx.Create(sb).Error; err != nil {
+			return fmt.Errorf("db: creating sandbox: %w", err)
+		}
+		return nil
+	})
+}
+
 // ErrSandboxDestroyed is returned by MarkSandboxActive when the row is already a
 // tombstone. A deploy that finishes after the user destroyed (or the reaper
 // expired) the sandbox must not resurrect it.
