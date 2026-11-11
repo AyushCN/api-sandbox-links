@@ -122,6 +122,7 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
+		Secure: r.TLS != nil,
 		MaxAge:   30 * 24 * 3600, // 30 days
 	})
 	http.Redirect(w, r, s.cfg.FrontendURL+"/dashboard?authed=1", http.StatusFound)
@@ -160,6 +161,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
+		Secure: r.TLS != nil,
 		MaxAge:   -1,
 		Expires:  time.Unix(0, 0),
 	})
