@@ -21,7 +21,7 @@ services:
       POSTGRES_PASSWORD: pass
       POSTGRES_DB: sandbox_platform
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5434:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -35,7 +35,7 @@ services:
     container_name: sandbox-platform-redis
     # Host 6379 is commonly already taken by a system redis; map to 6380.
     ports:
-      - "6380:6379"
+      - "127.0.0.1:6380:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -64,7 +64,7 @@ services:
       - --accesslog=true
     ports:
       - "80:80"
-      - "8081:8081"
+      - "127.0.0.1:8081:8081"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
