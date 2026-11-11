@@ -3,8 +3,6 @@ package reaper
 import (
 	"context"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/api-sandbox-links/backend/internal/config"
@@ -53,17 +51,25 @@ func (r *ExpiryReaper) tick(ctx context.Context) {
 		return
 	}
 	for _, sb := range due {
-		// If the sandbox never got past being queued, there is nothing running
-		// to tear down — just record the tombstone.
-		if sb.ContainerID != "" {
+		// Tear down by label even when container_id is empty: a deploy that
+		// failed before recording the container can still leave a sidecar,
+		// volume, network, or image behind. The nil guard keeps the reaper
+		// testable with a nil orchestrator; production always has one.
+		if r.orch != nil {
 			if err := r.orch.TeardownSandbox(ctx, sb); err != nil {
 				r.logger.Warn("expiry-reaper: teardown failed (will retry next tick)",
 					slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
 				continue
 			}
 		}
-		// Remove the on-disk working copy too: destruction is meant to be total.
-		_ = os.RemoveAll(filepath.Join(r.cfg.SandboxWorkDir, sb.Subdomain))
+		// Remove the on-disk working copy too: destruction is meant to be
+		// total. Validated: an empty subdomain would otherwise resolve to
+		// the work ROOT and delete every sandbox's files, and a subdomain
+		// with separators/.. could escape the root entirely.
+		if err := orchestrator.RemoveSandboxWorkDir(r.cfg.SandboxWorkDir, sb.Subdomain); err != nil {
+			r.logger.Warn("expiry-reaper: removing work dir",
+				slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
+		}
 
 		now := time.Now()
 		if err := r.store.UpdateSandbox(sb.ID, map[string]any{
@@ -76,6 +82,15 @@ func (r *ExpiryReaper) tick(ctx context.Context) {
 			r.logger.Warn("expiry-reaper: marking sandbox expired",
 				slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
 			continue
+		}
+		// Tombstone committed: sweep for containers a racing deploy created
+		// between the teardown above and this write (same contract as the
+		// manual destroy path).
+		if r.orch != nil {
+			if err := r.orch.SweepSandboxContainers(ctx, sb.ID); err != nil {
+				r.logger.Warn("expiry-reaper: post-tombstone container sweep",
+					slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
+			}
 		}
 		r.logger.Info("expiry-reaper: destroyed sandbox",
 			slog.String("sandbox", sb.ID), slog.String("subdomain", sb.Subdomain))

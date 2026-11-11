@@ -109,7 +109,16 @@ func (s *Server) handleDestroySandbox(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "could not destroy sandbox")
 		return
 	}
-	writeJSON(w, http.StatusOK, s.sandboxJSON(sb))
+	// destroyPermentally updates the row, not the in-memory struct. Re-read it
+	// so the response cannot claim a tombstone is still running with a container
+	// that was just removed.
+	destroyed, err := s.store.GetSandbox(sb.ID)
+	if err != nil {
+		s.logger.Warn("manual destroy reload failed", slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
+		writeErr(w, http.StatusInternalServerError, "sandbox destroyed but could not be reloaded")
+		return
+	}
+	writeJSON(w, http.StatusOK, s.sandboxJSON(destroyed))
 }
 
 // handleRedeploy triggers a manual rebuild (used after edits are saved and by
@@ -222,19 +231,54 @@ func (s *Server) handleStatsHistory(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// removeSandboxWorkDir deletes the working directory for a subdomain after
+// validating the path stays within the configured work root. The validation
+// itself lives in orchestrator.RemoveSandboxWorkDir so every deleter (this
+// handler, the expiry reaper, deploy-race cleanup) shares one implementation.
+func removeSandboxWorkDir(workRoot, subdomain string) error {
+	return orchestrator.RemoveSandboxWorkDir(workRoot, subdomain)
+}
+
 // destroyPermentally tears a sandbox down and records its tombstone. The typo
 // in the name is intentional documentation: this is permanent and unforgettable.
 func (s *Server) destroyPermentally(ctx context.Context, sb *db.Sandbox, reason db.DestructionReason) error {
-	if sb.ContainerID != "" {
-		if err := s.orch.TeardownSandbox(ctx, sb); err != nil {
-			return fmt.Errorf("teardown: %w", err)
+	if err := s.orch.TeardownSandbox(ctx, sb); err != nil {
+		return fmt.Errorf("teardown: %w", err)
+	}
+	// Remove the on-disk working copy too, mirroring expiry cleanup. Validate
+	// the path stays within the configured sandbox work root to avoid deleting
+	// the root or another sandbox's files.
+	if sb.Subdomain != "" {
+		if err := removeSandboxWorkDir(s.cfg.SandboxWorkDir, sb.Subdomain); err != nil {
+			s.logger.Warn("manual destroy: removing work dir failed",
+				slog.String("sandbox", sb.ID),
+				slog.String("subdomain", sb.Subdomain),
+				slog.String("err", err.Error()))
+			return fmt.Errorf("teardown: removing work dir: %w", err)
 		}
+	} else {
+		s.logger.Warn("manual destroy: empty subdomain, skipping work dir removal",
+			slog.String("sandbox", sb.ID))
+		return fmt.Errorf("teardown: empty subdomain")
 	}
 	now := time.Now()
-	return s.store.UpdateSandbox(sb.ID, map[string]any{
+	if err := s.store.UpdateSandbox(sb.ID, map[string]any{
 		"status":             string(db.StatusDeleted),
 		"destroyed_at":       now,
 		"destruction_reason": string(reason),
 		"container_id":       "",
-	})
+		"image_tag":          "",
+	}); err != nil {
+		return err
+	}
+	// Tombstone is committed: sweep once more for containers a racing deploy
+	// created between the teardown pass above and this commit. Best-effort —
+	// a sweep failure is logged because the destroy itself already succeeded,
+	// and any container created after the commit makes its own deploy fail on
+	// ErrSandboxDestroyed and tear down (see SweepSandboxContainers).
+	if err := s.orch.SweepSandboxContainers(ctx, sb.ID); err != nil {
+		s.logger.Warn("destroy: post-tombstone container sweep failed",
+			slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
+	}
+	return nil
 }
