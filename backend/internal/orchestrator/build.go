@@ -5,16 +5,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"strings"
 )
 
 // BuildPlan is the parsed, useful subset of `nixpacks plan` output. The
 // platform needs exactly three things from it: the detected language family,
 // the port the app listens on, and the start command.
 type BuildPlan struct {
-	Provider   string `json:"provider"`   // e.g. "node", "python", "go"
-	StartCmd   string `json:"start_cmd"`  // full command nixpacks would run
-	InternalPort int    `json:"internal_port"` // resolved app port
+	Provider         string `json:"provider"`      // e.g. "node", "python", "go"
+	StartCmd         string `json:"start_cmd"`     // full command nixpacks would run
+	InternalPort     int    `json:"internal_port"` // resolved app port
 	DetectedLanguage string `json:"detected_language"`
 }
 
@@ -22,11 +24,41 @@ type BuildPlan struct {
 // full JSON is much larger; unmarshalling loosely keeps this robust to
 // nixpacks version drift.
 type planPayload struct {
-	Providers []string `json:"providers"`
+	Providers []string          `json:"providers"`
 	Variables map[string]string `json:"variables"`
 	Start     struct {
 		Cmd string `json:"cmd"`
 	} `json:"start"`
+}
+
+// nixpacksEnv is a deny-by-default child environment for the legacy local
+// development executor. It excludes platform secrets, all DOCKER_* values,
+// proxy variables, and arbitrary NIXPACKS_* values (some may be credentials).
+// HOME is passed through as the parent's real home, NOT reset to a throwaway
+// directory: the Docker CLI resolves buildx from $HOME/.docker/cli-plugins,
+// so replacing HOME makes a perfectly valid host install look like "buildx is
+// not installed" and breaks every build. The allowlist still keeps platform
+// secrets and DOCKER_* out of the child; HOME only exposes the same user's
+// tool configuration, which the same-UID nixpacks process could read directly
+// anyway. This reduces accidental inheritance but is not isolation.
+func nixpacksEnv(home string) []string {
+	allowed := map[string]bool{
+		"PATH": true, "USER": true, "LOGNAME": true,
+		"LANG": true, "LC_ALL": true, "LC_CTYPE": true, "TZ": true,
+		"TMPDIR": true, "TMP": true, "TEMP": true,
+		"NIXPACKS_NODE_VERSION": true, "NIXPACKS_PYTHON_VERSION": true,
+		"NIXPACKS_GO_VERSION": true, "NIXPACKS_RUST_VERSION": true,
+		"NIXPACKS_JAVA_VERSION": true,
+	}
+	env := os.Environ()
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		key, _, ok := strings.Cut(kv, "=")
+		if ok && allowed[key] {
+			out = append(out, kv)
+		}
+	}
+	return append(out, "HOME="+home)
 }
 
 // PlanAnalyzes runs `nixpacks plan` in dir and returns the resolved build
@@ -34,6 +66,7 @@ type planPayload struct {
 // sensible defaults derived from the provider.
 func (o *Orchestrator) PlanAnalyze(ctx context.Context, dir string) (*BuildPlan, error) {
 	cmd := exec.CommandContext(ctx, o.cfg.NixpacksBin, "plan", dir)
+	cmd.Env = nixpacksEnv(os.Getenv("HOME"))
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -65,6 +98,7 @@ func (o *Orchestrator) PlanAnalyze(ctx context.Context, dir string) (*BuildPlan,
 // collector so the user can watch build progress).
 func (o *Orchestrator) BuildImage(ctx context.Context, dir, name string, progress *bytes.Buffer) (string, error) {
 	cmd := exec.CommandContext(ctx, o.cfg.NixpacksBin, "build", "--name", name, dir)
+	cmd.Env = nixpacksEnv(os.Getenv("HOME"))
 	if progress != nil {
 		cmd.Stdout = progress
 		cmd.Stderr = progress
