@@ -245,3 +245,28 @@ func TestCleanupWorkDirIfDestroyedOnlyTouchesTombstones(t *testing.T) {
 		t.Error("repeated cleanup did not converge")
 	}
 }
+
+// A second deploy must block on the semaphore until the first releases it, and
+// a cancelled waiter must return instead of hanging.
+func TestAcquireBuildSlotQueuesAndHonoursCancellation(t *testing.T) {
+	d := &Deployer{buildSem: make(chan struct{}, 1)}
+	release, err := d.acquireBuildSlot(context.Background())
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := d.acquireBuildSlot(waitCtx); err == nil {
+		t.Fatal("second acquire succeeded while the only slot was held")
+	}
+
+	release()
+	thirdCtx, thirdCancel := context.WithTimeout(context.Background(), time.Second)
+	defer thirdCancel()
+	releaseThird, err := d.acquireBuildSlot(thirdCtx)
+	if err != nil {
+		t.Fatalf("acquire after release: %v", err)
+	}
+	releaseThird()
+}

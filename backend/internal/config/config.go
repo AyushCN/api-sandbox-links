@@ -74,6 +74,10 @@ type Config struct {
 	// built Config with zero disables the cap (test harnesses); config.Load
 	// always sets a positive value.
 	MaxRunningSandboxes int
+	// BuildConcurrency caps how many deploys may clone/build/start a container
+	// at the same time. Extra deploys wait in the queue (sandbox status
+	// 'queued') until a slot frees. Default 2.
+	BuildConcurrency int
 }
 
 // Load reads .env (if present) and the process environment, then parses it
@@ -100,6 +104,7 @@ func Load() (*Config, error) {
 		MaxLifetimeSeconds:        envInt64Default("MAX_LIFETIME_SECONDS", 7*24*3600),
 		MaxActiveSandboxesPerUser: envIntDefault("MAX_ACTIVE_SANDBOXES_PER_USER", 3),
 		MaxRunningSandboxes:       envIntDefault("MAX_RUNNING_SANDBOXES", 6),
+		BuildConcurrency:          envIntDefault("BUILD_CONCURRENCY", 2),
 		DevAuth:                   os.Getenv("GITHUB_CLIENT_ID") == "",
 	}
 
@@ -120,6 +125,9 @@ func Load() (*Config, error) {
 	}
 	if cfg.MaxRunningSandboxes < 1 || cfg.MaxRunningSandboxes > 1000 {
 		return nil, fmt.Errorf("config: MAX_RUNNING_SANDBOXES must be between 1 and 1000, got %d", cfg.MaxRunningSandboxes)
+	}
+	if cfg.BuildConcurrency < 1 || cfg.BuildConcurrency > 100 {
+		return nil, fmt.Errorf("config: BUILD_CONCURRENCY must be between 1 and 100, got %d", cfg.BuildConcurrency)
 	}
 	return cfg, nil
 }

@@ -134,7 +134,7 @@ func (s *Server) handleRedeploy(w http.ResponseWriter, r *http.Request) {
 	}
 	opts := orchestrator.DeployOptions{Trigger: db.TriggerManual}
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), orchestrator.DeployTimeout)
 		defer cancel()
 		if err := s.deployer.DeploySandbox(ctx, sb, opts); err != nil {
 			s.logger.Warn("manual redeploy failed", slog.String("sandbox", sb.ID), slog.String("err", err.Error()))

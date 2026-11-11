@@ -95,7 +95,7 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 
 // forkDeploy prepares the child's working copy and sidecar DBs, then deploys.
 func (s *Server) forkDeploy(parentCtx context.Context, parent, child *db.Sandbox) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), orchestrator.DeployTimeout)
 	defer cancel()
 
 	// 1. Deep-copy the parent's working directory so current edits carry over.

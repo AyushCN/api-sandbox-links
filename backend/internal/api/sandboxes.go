@@ -158,7 +158,7 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	// Deploy asynchronously; the client polls the sandbox until running.
 	opts := orchestrator.DeployOptions{Trigger: db.TriggerInitial, DatabaseOverride: req.Database}
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), orchestrator.DeployTimeout)
 		defer cancel()
 		if err := s.deployer.DeploySandbox(ctx, sandbox, opts); err != nil {
 			s.logger.Warn("deploy failed", slog.String("sandbox", sandbox.ID), slog.String("err", err.Error()))

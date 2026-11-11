@@ -24,17 +24,50 @@ import (
 // build, container run, sidecar DB wiring, and status persistence. It is the
 // shared path for the initial creation, save-and-redeploy, forks, and manual
 // redeploys, kept in one place so every trigger behaves identically.
+
+// DeployTimeout bounds one deploy from the moment it starts waiting for a
+// build slot through the final activation. A queued build is included: the
+// slot wait is part of the caller's deploy budget, not separate from it.
+const DeployTimeout = 20 * time.Minute
+
+const defaultBuildConcurrency = 2
+
 type Deployer struct {
 	cfg   *config.Config
 	store *db.Store
 	orch  *Orchestrator
 	box   *secret.Box
 	cache *cache.Redis
+
+	// buildSem limits how many clones/builds/container starts run at once.
+	// Nil means unlimited; only direct Deployer construction in tests omits it.
+	buildSem chan struct{}
 }
 
 // NewDeployer builds the deploy coordinator.
 func NewDeployer(cfg *config.Config, store *db.Store, orch *Orchestrator, box *secret.Box, cache *cache.Redis) *Deployer {
-	return &Deployer{cfg: cfg, store: store, orch: orch, box: box, cache: cache}
+	concurrency := cfg.BuildConcurrency
+	if concurrency < 1 {
+		concurrency = defaultBuildConcurrency
+	}
+	return &Deployer{
+		cfg: cfg, store: store, orch: orch, box: box, cache: cache,
+		buildSem: make(chan struct{}, concurrency),
+	}
+}
+
+// acquireBuildSlot waits for a build slot or for the deploy context to end.
+// It returns a release function that is safe to call exactly once per success.
+func (d *Deployer) acquireBuildSlot(ctx context.Context) (func(), error) {
+	if d.buildSem == nil {
+		return func() {}, nil
+	}
+	select {
+	case d.buildSem <- struct{}{}:
+		return func() { <-d.buildSem }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // sandboxDir returns the on-disk clone directory for a sandbox.
@@ -76,7 +109,7 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 	deploy, err := d.store.CreateDeployment(&db.Deployment{
 		SandboxID: sandbox.ID,
 		Trigger:   string(opts.Trigger),
-		Status:    string(db.DeployBuilding),
+		Status:    string(db.DeployPending),
 	})
 	if err != nil {
 		return fmt.Errorf("deploy: recording deployment: %w", err)
@@ -121,8 +154,23 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 		})
 	}
 
-	if err := d.store.UpdateSandbox(sandbox.ID, map[string]any{"status": string(db.StatusBuilding)}); err != nil {
+	// Queue behind other builds before doing any expensive work. The row is
+	// 'queued' while waiting and only becomes 'building' after a slot is held,
+	// so the UI can distinguish "waiting for capacity" from "compiling".
+	if err := d.store.UpdateSandbox(sandbox.ID, map[string]any{"status": string(db.StatusQueued)}); err != nil {
 		return err
+	}
+	release, err := d.acquireBuildSlot(ctx)
+	if err != nil {
+		return markFailed(fmt.Errorf("deploy: waiting for build slot: %w", err))
+	}
+	defer release()
+
+	if err := d.store.UpdateDeployment(deploy.ID, map[string]any{"status": string(db.DeployBuilding)}); err != nil {
+		return markFailed(fmt.Errorf("deploy: marking deployment building: %w", err))
+	}
+	if err := d.store.UpdateSandbox(sandbox.ID, map[string]any{"status": string(db.StatusBuilding)}); err != nil {
+		return markFailed(fmt.Errorf("deploy: marking sandbox building: %w", err))
 	}
 
 	workDir := d.sandboxDir(sandbox.Subdomain)

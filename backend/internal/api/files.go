@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/api-sandbox-links/backend/internal/db"
 	"github.com/api-sandbox-links/backend/internal/orchestrator"
@@ -177,7 +176,7 @@ func (s *Server) handleSaveFile(w http.ResponseWriter, r *http.Request) {
 	if !already {
 		go func() {
 			defer redeployLocks.Delete(sb.ID)
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			ctx, cancel := context.WithTimeout(context.Background(), orchestrator.DeployTimeout)
 			defer cancel()
 			if err := s.deployer.DeploySandbox(ctx, sb, orchestrator.DeployOptions{Trigger: db.TriggerSaveRedeploy}); err != nil {
 				s.logger.Warn("save redeploy failed", slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
