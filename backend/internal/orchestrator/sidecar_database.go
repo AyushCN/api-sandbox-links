@@ -98,15 +98,18 @@ func (o *Orchestrator) ProvisionDatabase(ctx context.Context, sandbox *db.Sandbo
 	env := []string{}
 	mount := fmt.Sprintf("%s:/var/lib/postgresql/data", volName)
 	cc := &container.Config{Image: image, Env: env}
-	hc := &container.HostConfig{
-		Binds: []string{mount},
-	}
+	hc := sidecarHostConfig(mount, "postgres")
 	switch engine {
 	case "postgres":
-		cc.Env = []string{"POSTGRES_USER=" + user, "POSTGRES_PASSWORD=" + pass, "POSTGRES_DB=" + dbName}
+		// sidecarHostConfig already sets up everything
+		break
 	case "mysql":
-		cc.Env = []string{"MYSQL_USER=" + user, "MYSQL_PASSWORD=" + pass, "MYSQL_DATABASE=" + dbName, "MYSQL_ROOT_PASSWORD=" + pass}
-		hc.Binds = []string{fmt.Sprintf("%s:/var/lib/mysql", volName)}
+		mount2 := fmt.Sprintf("%s:/var/lib/mysql", volName)
+		hc2 := sidecarHostConfig(mount2, "mysql")
+		// Override the binds with the mysql-specific volume mount
+		hc2.Binds = []string{mount2}
+		hc = hc2
+		break
 	}
 
 	nc := &network.NetworkingConfig{EndpointsConfig: map[string]*network.EndpointSettings{

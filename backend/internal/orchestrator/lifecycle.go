@@ -19,21 +19,153 @@ const (
 	defaultMemoryLimit = 512 * 1024 * 1024 // 512 MB
 	defaultCPUQuota    = 0.75              // 75% of one core
 	defaultPIDsLimit   = 256
-	imageUser          = "" // stay as image default (often root); gVisor is future hardening
+	// imageUser stays empty: the image picks its own runtime user (often root).
+	// Forcing a UID here would break repos whose app writes to root-owned paths,
+	// and the containment that matters for untrusted code is the capability /
+	// no-new-privileges policy below, not the uid. Enforcing a non-root user
+	// per image is tracked as separate, unproven hardening.
+	imageUser = ""
 )
 
 var defaultPIDs = int64(defaultPIDsLimit)
 
+// Sandbox app-container isolation policy (applied by sandboxHostConfig):
+//
+//   - CapDrop ALL removes every Linux capability the container would inherit
+//     as root (NET_RAW, SYS_ADMIN, DAC_OVERRIDE, ...), shrinking the kernel
+//     attack surface available to untrusted repository code.
+//   - CapAdd NET_BIND_SERVICE is the single capability kept back: nixpacks'
+//     `static` provider defaults to port 80, and binding a port below 1024
+//     needs this capability even for uid 0.
+//   - no-new-privileges then stops any setuid binary or file capability inside
+//     the image from re-elevating at exec time, which is what makes the drops
+//     above stick.
+//
+// These are slices rather than literals so the policy is asserted by
+// isolation_test.go without a daemon and verified as actually applied by
+// isolation_runtime_test.go against a live one.
+var (
+	sandboxCapDrop     = []string{"ALL"}
+	sandboxCapAdd      = []string{"NET_BIND_SERVICE"}
+	sandboxSecurityOpt = []string{"no-new-privileges:true"}
+
+	// Sidecar databases run the official postgres/mysql entrypoints, which
+	// start as root and drop to the database user with gosu. They need these
+	// five capabilities for first boot; everything else is dropped.
+	sidecarCapDrop     = []string{"ALL"}
+	sidecarCapAdd      = []string{"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"}
+	sidecarSecurityOpt = []string{"no-new-privileges:true"}
+)
+
+// sandboxLogConfig bounds container log growth. Without it the Docker default
+// json-file driver grows without limit and a noisy sandbox can fill the host.
+func sandboxLogConfig() container.LogConfig {
+	return container.LogConfig{
+		Type:   "json-file",
+		Config: map[string]string{"max-size": "10m", "max-file": "3"},
+	}
+}
+
+// sandboxRestartPolicy restarts a crashed process a few times but never
+// resurrects a container the platform intentionally stopped.
+func sandboxRestartPolicy() container.RestartPolicy {
+	return container.RestartPolicy{Name: "on-failure", MaximumRetryCount: 3}
+}
+
+// sandboxHostConfig builds the HostConfig every sandbox app container runs
+// with: resource limits (memory/CPU/PIDs), the isolation policy documented
+// above, and a restart policy that lets the platform recover a sandbox after
+// a daemon reboot. It is a pure function so the policy is unit-testable with
+// no Docker daemon in reach.
+func sandboxHostConfig() *container.HostConfig {
+	pids := defaultPIDs // fresh pointer per call; the SDK only reads it
+	return &container.HostConfig{
+		Resources: container.Resources{
+			// Promoted fields (embedded struct) must be set via the Resources
+			// key inside a composite literal. MemorySwap == Memory disables
+			// swap for the container, so it cannot exceed its memory budget.
+			Memory:     defaultMemoryLimit,
+			MemorySwap: defaultMemoryLimit,
+			NanoCPUs:   int64(defaultCPUQuota * 1e9),
+			PidsLimit:  &pids,
+		},
+		CapDrop:       append([]string(nil), sandboxCapDrop...),
+		CapAdd:        append([]string(nil), sandboxCapAdd...),
+		SecurityOpt:   append([]string(nil), sandboxSecurityOpt...),
+		RestartPolicy: sandboxRestartPolicy(),
+		LogConfig:     sandboxLogConfig(),
+	}
+}
+
+// sidecarHostConfig builds the HostConfig every sidecar DB container runs
+// with resource limits and the isolation policy documented above.
+func sidecarHostConfig(bind string, engine string) *container.HostConfig {
+	pids := defaultPIDs // fresh pointer per call; the SDK only reads it
+	switch engine {
+	case "postgres":
+		return &container.HostConfig{
+			Resources: container.Resources{
+				Memory:     defaultMemoryLimit,
+				MemorySwap: defaultMemoryLimit, // MemorySwap == Memory disables swap
+				NanoCPUs:   int64(defaultCPUQuota * 1e9),
+				PidsLimit:  &pids,
+			},
+			CapDrop:       append([]string(nil), sidecarCapDrop...),
+			CapAdd:        append([]string(nil), sidecarCapAdd...),
+			SecurityOpt:   append([]string(nil), sidecarSecurityOpt...),
+			RestartPolicy: sandboxRestartPolicy(),
+			LogConfig:     sandboxLogConfig(),
+			Binds:         []string{bind},
+		}
+	case "mysql":
+		return &container.HostConfig{
+			Resources: container.Resources{
+				Memory:     defaultMemoryLimit,
+				MemorySwap: defaultMemoryLimit, // MemorySwap == Memory disables swap
+				NanoCPUs:   int64(defaultCPUQuota * 1e9),
+				PidsLimit:  &pids,
+			},
+			CapDrop:       append([]string(nil), sidecarCapDrop...),
+			CapAdd:        append([]string(nil), sidecarCapAdd...),
+			SecurityOpt:   append([]string(nil), sidecarSecurityOpt...),
+			RestartPolicy: sandboxRestartPolicy(),
+			LogConfig:     sandboxLogConfig(),
+			Binds:         []string{fmt.Sprintf("%s:/var/lib/mysql", bind)},
+		}
+	default:
+		return &container.HostConfig{}
+	}
+}
+
+// sandboxNetworkOptions is the CreateOptions for a sandbox's private bridge.
+//
+// DECISION (network): deliberately an ordinary bridge, NOT Internal: true.
+// An internal network blocks all outbound traffic, and sandboxes need egress —
+// apps fetch packages on first boot, call external APIs, and expect working
+// DNS. The protection Internal: true would buy (sandboxes cannot reach
+// host-published ports) is obtained instead by binding platform services to
+// 127.0.0.1 in docker-compose.dev.yml: a loopback-bound socket is never
+// reachable via the bridge gateway IP, while an 0.0.0.0 one is — and that
+// keeps egress intact. No host firewall rules are deployed for this platform,
+// so this binding policy is the only thing standing between sandbox code and
+// the platform's Postgres/Redis. Do not flip Internal without replacing it.
+func sandboxNetworkOptions() network.CreateOptions {
+	return network.CreateOptions{
+		Driver: "bridge",
+		Labels: map[string]string{"api-sandbox-links.purpose": "private-sandbox"},
+	}
+}
+
 // RunOptions describes a container the orchestrator should start for a sandbox.
 type RunOptions struct {
-	SandboxID   string
-	ImageTag    string
-	Subdomain   string
+	SandboxID    string
+	ImageTag     string
+	Subdomain    string
 	InternalPort int
-	Env         []string        // KEY=VALUE pairs, already decrypted
-	NetworkName string          // private per-sandbox network
-	Labels      map[string]string // extra labels (traefik, provenance)
-	User        string
+	Env          []string          // KEY=VALUE pairs, already decrypted
+	NetworkName  string            // private per-sandbox network
+	Labels       map[string]string // extra labels (traefik, provenance)
+	User         string
 }
 
 // RunResult reports where the container landed so callers can store it.
@@ -50,10 +182,13 @@ func netName(sandboxID string) string { return "sandbox_" + sandboxID[:8] }
 // volumeName returns a Docker volume name for a sandbox (used by sidecar DBs).
 func volumeName(sandboxID string) string { return "sandboxdata_" + sandboxID[:8] }
 
-// ensureNetwork creates the sandbox's private network if it is not present.
-// One private network per sandbox is what gives the platform its isolation
-// story: the app container and its sidecar DB can talk to each other but no
-// other tenant's containers can.
+// ensureNetwork creates the sandbox's private network if it is not present
+// and always returns the network NAME (never the daemon's ID), so callers can
+// use it directly as a NetworkingConfig endpoint key and as the lookup key in
+// ContainerInspect's NetworkSettings.Networks map. One private network per
+// sandbox is what gives the platform its isolation story: the app container
+// and its sidecar DB can talk to each other but no other tenant's containers
+// can.
 func (o *Orchestrator) ensureNetwork(ctx context.Context, sandboxID string) (string, error) {
 	name := netName(sandboxID)
 	_, err := o.docker.NetworkInspect(ctx, name, network.InspectOptions{})
@@ -63,14 +198,10 @@ func (o *Orchestrator) ensureNetwork(ctx context.Context, sandboxID string) (str
 	if !client.IsErrNotFound(err) {
 		return "", fmt.Errorf("orchestrator: inspecting network %s: %w", name, err)
 	}
-	r, err := o.docker.NetworkCreate(ctx, name, network.CreateOptions{
-		Driver: "bridge",
-		Labels: map[string]string{"api-sandbox-links.purpose": "private-sandbox"},
-	})
-	if err != nil {
+	if _, err := o.docker.NetworkCreate(ctx, name, sandboxNetworkOptions()); err != nil {
 		return "", fmt.Errorf("orchestrator: creating network %s: %w", name, err)
 	}
-	return r.ID, nil
+	return name, nil
 }
 
 // RunSandbox provisions the private network and starts the app container with
@@ -96,10 +227,10 @@ func (o *Orchestrator) RunSandbox(ctx context.Context, opts RunOptions) (*RunRes
 		// Traefik direct-route fallback (priority 1 loses to the wildcard
 		// gateway router — see DECISION above).
 		"traefik.enable": "true",
-		"traefik.http.routers." + opts.Subdomain + ".rule":       "Host(`" + opts.Subdomain + "." + o.cfg.SandboxBaseDomain + "`)",
-		"traefik.http.routers." + opts.Subdomain + ".entrypoints": "web",
-		"traefik.http.routers." + opts.Subdomain + ".priority":    "1",
-		"traefik.http.routers." + opts.Subdomain + ".service":     opts.Subdomain,
+		"traefik.http.routers." + opts.Subdomain + ".rule":                      "Host(`" + opts.Subdomain + "." + o.cfg.SandboxBaseDomain + "`)",
+		"traefik.http.routers." + opts.Subdomain + ".entrypoints":               "web",
+		"traefik.http.routers." + opts.Subdomain + ".priority":                  "1",
+		"traefik.http.routers." + opts.Subdomain + ".service":                   opts.Subdomain,
 		"traefik.http.services." + opts.Subdomain + ".loadbalancer.server.port": itoa(opts.InternalPort),
 	}
 	for k, v := range opts.Labels {
@@ -107,23 +238,14 @@ func (o *Orchestrator) RunSandbox(ctx context.Context, opts RunOptions) (*RunRes
 	}
 
 	cc := &container.Config{
-		Image: opts.ImageTag,
-		Env:   opts.Env,
+		Image:  opts.ImageTag,
+		Env:    opts.Env,
 		Labels: labels,
 	}
 	if opts.User != "" {
 		cc.User = opts.User
 	}
-	hc := &container.HostConfig{
-		Resources: container.Resources{
-			// Promoted fields (embedded struct) must be set via the Resources
-			// key inside a composite literal.
-			Memory:    defaultMemoryLimit,
-			NanoCPUs:  int64(defaultCPUQuota * 1e9),
-			PidsLimit: &defaultPIDs,
-		},
-		RestartPolicy: container.RestartPolicy{Name: "unless-stopped"},
-	}
+	hc := sandboxHostConfig()
 	nc := &network.NetworkingConfig{
 		EndpointsConfig: map[string]*network.EndpointSettings{
 			netName(opts.SandboxID): {NetworkID: ""},
