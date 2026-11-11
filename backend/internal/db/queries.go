@@ -359,6 +359,18 @@ func (s *Store) ListSandboxDatabases(sandboxID string) ([]*SandboxDatabase, erro
 	return out, nil
 }
 
+// DeleteSandboxDatabases drops the sidecar metadata for a sandbox. Teardown
+// calls it after the containers and volumes are gone: without this, the row
+// outlives the data it describes and a later deploy can believe a sidecar
+// exists when it does not.
+func (s *Store) DeleteSandboxDatabases(sandboxID string) (int64, error) {
+	res := s.db.Where("sandbox_id = ?", sandboxID).Delete(&SandboxDatabase{})
+	if res.Error != nil {
+		return 0, fmt.Errorf("db: deleting sandbox databases for %s: %w", sandboxID, res.Error)
+	}
+	return res.RowsAffected, nil
+}
+
 // GetSandboxDatabase fetches one sidecar DB by id.
 func (s *Store) GetSandboxDatabase(id string) (*SandboxDatabase, error) {
 	d := &SandboxDatabase{}

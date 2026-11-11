@@ -199,3 +199,34 @@ func sprintfUUID(seed, hi, lo uint32) string {
 	return fmt.Sprintf("%08x-%04x-4%03x-8%03x-%04x%08x",
 		seed, hi&0xffff, lo&0x0fff, hi&0x0fff, lo&0xffff, lo)
 }
+
+// Volume labels are what let teardown find a sidecar volume after a deploy
+// failed before the sandbox_databases row was written.
+func TestVolumeCreateCarriesSandboxLabel(t *testing.T) {
+	opts := volumeCreate("sandboxdata_abc123", "sb-123")
+	if opts.Name != "sandboxdata_abc123" {
+		t.Errorf("Name = %q", opts.Name)
+	}
+	if opts.Labels[SandboxIDLabel] != "sb-123" {
+		t.Errorf("labels = %v, want %s=sb-123", opts.Labels, SandboxIDLabel)
+	}
+}
+
+// Teardown may only remove images this platform built. A legacy/test row with
+// an unrelated tag must never make it delete somebody else's image.
+func TestSandboxImageRefOnlyTrustsPlatformTagOrSubdomain(t *testing.T) {
+	cases := []struct {
+		name string
+		sb   *db.Sandbox
+		want string
+	}{
+		{"platform tag", &db.Sandbox{ImageTag: "sandbox-demo:latest"}, "sandbox-demo:latest"},
+		{"derived from subdomain", &db.Sandbox{Subdomain: "demo"}, "sandbox-demo:latest"},
+		{"unrelated tag", &db.Sandbox{ImageTag: "latest", Subdomain: ""}, ""},
+	}
+	for _, tc := range cases {
+		if got := sandboxImageRef(tc.sb); got != tc.want {
+			t.Errorf("%s: sandboxImageRef() = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}

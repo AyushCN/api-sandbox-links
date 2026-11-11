@@ -64,6 +64,15 @@ type DeployOptions struct {
 //  5. turn off any previous container for this sandbox,
 //  6. run the new container on the private network with limits + labels.
 func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts DeployOptions) error {
+	// Reload sandbox instead of creating new one, if it existed before
+	fresh, err := d.store.GetSandbox(sandbox.ID)
+	if err != nil {
+		return fmt.Errorf("deploy: reloading sandbox: %w", err)
+	}
+	if fresh.DestroyedAt != nil {
+		return fmt.Errorf("deploy: sandbox %s was destroyed; refusing to deploy", sandbox.ID)
+	}
+
 	deploy, err := d.store.CreateDeployment(&db.Deployment{
 		SandboxID: sandbox.ID,
 		Trigger:   string(opts.Trigger),
@@ -73,13 +82,40 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 		return fmt.Errorf("deploy: recording deployment: %w", err)
 	}
 
-	markFailed := func(cause error) error {
+	markFailed := func(cause error, logs ...string) error {
 		now := deploymentFinished()
+		logExcerpt := cause.Error()
+		if len(logs) > 0 && logs[0] != "" {
+			// Include build output if available
+			combined := logs[0]
+			if combined != "" {
+				logExcerpt = truncate(combined+"\n"+cause.Error(), 4000)
+			}
+		}
 		_ = d.store.UpdateDeployment(deploy.ID, map[string]any{
 			"status":      string(db.DeployFailed),
-			"log_excerpt": cause.Error(),
+			"log_excerpt": logExcerpt,
 			"finished_at": now,
 		})
+		// A failed deploy must not leave any runtime behind. Tear down by the
+		// sandbox-id label (not the stored container ID, which may still be
+		// empty) so orphan app containers, sidecars, volumes, the network, and
+		// the image are all reclaimed before the row is marked failed.
+		if d.orch != nil && d.orch.docker != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if err := d.orch.TeardownSandbox(cleanupCtx, sandbox); err != nil {
+				d.orch.logger.Warn("deploy: tearing down failed deploy",
+					slog.String("sandbox", sandbox.ID), slog.String("err", err.Error()))
+			}
+			cancel()
+		}
+		// LIVE sandbox keeps its directory on failure: it may hold user edits from the file manager,
+		// and it is reclaimed at expires_at by the reaper, so nothing is
+		// abandoned indefinitely.
+		if d.cleanupWorkDirIfDestroyed(sandbox.ID, sandbox.Subdomain) {
+			d.orch.logger.Info("deploy: failed build on destroyed sandbox; removed work dir",
+				slog.String("sandbox", sandbox.ID))
+		}
 		return d.store.UpdateSandbox(sandbox.ID, map[string]any{
 			"status": string(db.StatusFailed),
 		})
@@ -99,7 +135,16 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 			return markFailed(fmt.Errorf("deploy: loading repository: %w", err))
 		}
 		if _, err := git.Clone(ctx, repo.GithubURL, sandbox.BranchName, workDir); err != nil {
+			// remove partial clone
+			if rmErr := RemoveSandboxWorkDir(d.cfg.SandboxWorkDir, sandbox.Subdomain); rmErr != nil {
+				d.orch.logger.Warn("deploy: removing partial clone after failure",
+					slog.String("sandbox", sandbox.ID), slog.String("err", rmErr.Error()))
+			}
 			return markFailed(err)
+		}
+		// cleanup
+		if d.cleanupWorkDirIfDestroyed(sandbox.ID, sandbox.Subdomain) {
+			return markFailed(fmt.Errorf("deploy: sandbox was destroyed while cloning"))
 		}
 	}
 
@@ -118,7 +163,7 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 
 	imageTag, err := d.orch.BuildImage(ctx, workDir, "sandbox-"+sandbox.Subdomain, buildLog)
 	if err != nil {
-		return markFailed(err)
+		return markFailed(err, buildLog.String())
 	}
 
 	// Shut down and remove any previous container so the new image takes over.
@@ -182,6 +227,15 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 		d.orch.logger.Warn("deploy: sandbox was destroyed while building; discarding the new container",
 			slog.String("sandbox", sandbox.ID), slog.String("container", result.ContainerID))
 		_ = d.orch.TeardownSandbox(ctx, sandbox)
+		// The deploy may have re-created the work directory after the destroy
+		// removed it (clone-then-destroy race); destroy it again so a deleted
+		// sandbox never leaves files behind. RemoveSandboxWorkDir validates
+		// the path and is idempotent, so this is safe even when the destroy
+		// already removed it.
+		if rmErr := RemoveSandboxWorkDir(d.cfg.SandboxWorkDir, sandbox.Subdomain); rmErr != nil {
+			d.orch.logger.Warn("deploy: removing work dir of destroyed sandbox",
+				slog.String("sandbox", sandbox.ID), slog.String("err", rmErr.Error()))
+		}
 		return d.store.UpdateDeployment(deploy.ID, map[string]any{
 			"status":      string(db.DeployFailed),
 			"log_excerpt": "sandbox was destroyed while this deployment was still building",

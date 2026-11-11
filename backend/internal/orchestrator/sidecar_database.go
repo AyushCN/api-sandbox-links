@@ -13,7 +13,6 @@ import (
 	"github.com/api-sandbox-links/backend/internal/db"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/api/types/volume"
 )
 
 // dbImage is the sidecar image used per engine. SQLite needs nothing (it lives
@@ -88,10 +87,11 @@ func (o *Orchestrator) ProvisionDatabase(ctx context.Context, sandbox *db.Sandbo
 	}
 	user, dbName := "sandbox", "sandboxdb"
 
-	// Volume lives independent of the container so a redeploy of the app (or a
-	// fork duplicating the volume) doesn't lose data.
-	volName := volumeName(newID()) // unique per DB provision
-	if _, err := o.docker.VolumeCreate(ctx, volume.CreateOptions{Name: volName}); err != nil {
+	// Tie the volume name to the database row ID: teardown and forks derive
+	// this name from the row, so generating an unrelated ID here leaks data.
+	databaseID := newID()
+	volName := volumeName(databaseID)
+	if _, err := o.docker.VolumeCreate(ctx, volumeCreate(volName, sandbox.ID)); err != nil {
 		return nil, "", fmt.Errorf("orchestrator: creating db volume: %w", err)
 	}
 
@@ -140,6 +140,7 @@ func (o *Orchestrator) ProvisionDatabase(ctx context.Context, sandbox *db.Sandbo
 		return nil, "", fmt.Errorf("orchestrator: encrypting db connection url: %w", err)
 	}
 	row := &db.SandboxDatabase{
+		ID:            databaseID,
 		SandboxID:     sandbox.ID,
 		Engine:        engine,
 		ContainerID:   resp.ID,

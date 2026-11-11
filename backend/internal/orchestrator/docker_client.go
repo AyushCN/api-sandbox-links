@@ -72,12 +72,15 @@ func (o *Orchestrator) Close() error {
 // Logger exposes the slog logger for use by helpers in this package.
 func (o *Orchestrator) Logger() *slog.Logger { return o.logger }
 
-// volumeCreate builds the options for a named, labelled Docker volume.
-func volumeCreate(name string) volume.CreateOptions {
-	return volume.CreateOptions{
-		Name:   name,
-		Labels: map[string]string{"api-sandbox-links.purpose": "sandbox-data"},
+// volumeCreate builds the options for a named, labelled Docker volume. The
+// sandbox-id label is what lets teardown reclaim volumes even when the
+// sandbox_databases row was never written (for example a failed first deploy).
+func volumeCreate(name, sandboxID string) volume.CreateOptions {
+	labels := map[string]string{"api-sandbox-links.purpose": "sandbox-data"}
+	if sandboxID != "" {
+		labels[SandboxIDLabel] = sandboxID
 	}
+	return volume.CreateOptions{Name: name, Labels: labels}
 }
 
 // newID returns a UUID string for rows the DB model expects populated client-side.

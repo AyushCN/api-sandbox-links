@@ -10,7 +10,6 @@ import (
 	"github.com/api-sandbox-links/backend/internal/db"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/api/types/volume"
 )
 
 // CopyVolume duplicates the contents of src volume into dst volume using a
@@ -18,8 +17,8 @@ import (
 // block-level Copy-on-Write storage (see docs/ARCHITECTURE.md §Known
 // simplifications): the fork just gets its own files, not a CoW dependency on
 // the parent.
-func (o *Orchestrator) CopyVolume(ctx context.Context, src, dst string) error {
-	if _, err := o.docker.VolumeCreate(ctx, volume.CreateOptions{Name: dst}); err != nil {
+func (o *Orchestrator) CopyVolume(ctx context.Context, src, dst, sandboxID string) error {
+	if _, err := o.docker.VolumeCreate(ctx, volumeCreate(dst, sandboxID)); err != nil {
 		return fmt.Errorf("orchestrator: creating fork volume: %w", err)
 	}
 
@@ -79,8 +78,10 @@ func (o *Orchestrator) ForkDatabase(ctx context.Context, parent *db.SandboxDatab
 		return nil, "", fmt.Errorf("orchestrator: decrypting parent connection url: %w", err)
 	}
 
-	newVol := volumeName(newID())
-	if err := o.CopyVolume(ctx, volumeName(parent.ID), newVol); err != nil {
+	databaseID := newID()
+	newVol := volumeName(databaseID)
+	if err := o.CopyVolume(ctx, volumeName(parent.ID), newVol, childSandboxID); err != nil {
+		_ = o.RemoveVolume(ctx, newVol)
 		return nil, "", fmt.Errorf("orchestrator: copying database volume: %w", err)
 	}
 
@@ -122,6 +123,7 @@ func (o *Orchestrator) ForkDatabase(ctx context.Context, parent *db.SandboxDatab
 		return nil, "", err
 	}
 	row := &db.SandboxDatabase{
+		ID:            databaseID,
 		SandboxID:     childSandboxID,
 		Engine:        parent.Engine,
 		ContainerID:   resp.ID,
