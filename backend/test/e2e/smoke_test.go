@@ -198,10 +198,16 @@ func TestSmokeDeployNodeJSSample(t *testing.T) {
 	purge()
 	t.Cleanup(purge)
 
+	encryptedToken, err := env.secretBox.Encrypt([]byte("smoke-test-token"))
+	if err != nil {
+		t.Fatalf("failed to encrypt smoke token: %v", err)
+	}
+
 	user := &db.User{
-		GithubID: tag,
-		Username: "smoke-tester",
-		Email:    "smoke@example.test",
+		GithubID:    tag,
+		Username:    "smoke-tester",
+		Email:       "smoke@example.test",
+		GithubToken: encryptedToken,
 	}
 	if err := env.store.UpsertUser(user); err != nil {
 		t.Fatalf("failed to seed smoke user: %v", err)
