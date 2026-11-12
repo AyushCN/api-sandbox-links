@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,7 +13,9 @@ import (
 
 	"github.com/api-sandbox-links/backend/internal/db"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/client"
 )
 
 // dbImage is the sidecar image used per engine. SQLite needs nothing (it lives
@@ -73,6 +76,9 @@ func (o *Orchestrator) ProvisionDatabase(ctx context.Context, sandbox *db.Sandbo
 	if !ok {
 		return nil, "", fmt.Errorf("orchestrator: unsupported sidecar engine %q", engine)
 	}
+	if err := o.ensureImage(ctx, image); err != nil {
+		return nil, "", err
+	}
 
 	// The private per-sandbox network is created lazily by RunSandbox, which
 	// runs later in the deploy pipeline — provision the sidecar on it now so
@@ -95,7 +101,7 @@ func (o *Orchestrator) ProvisionDatabase(ctx context.Context, sandbox *db.Sandbo
 		return nil, "", fmt.Errorf("orchestrator: creating db volume: %w", err)
 	}
 
-	env := []string{}
+	env := sidecarEnv(engine, user, pass, dbName)
 	mount := fmt.Sprintf("%s:/var/lib/postgresql/data", volName)
 	cc := &container.Config{Image: image, Env: env}
 	hc := sidecarHostConfig(mount, "postgres")
@@ -155,6 +161,30 @@ func (o *Orchestrator) ProvisionDatabase(ctx context.Context, sandbox *db.Sandbo
 	return row, connURL, nil
 }
 
+// sidecarEnv returns the first-boot credentials the official images require.
+// Without these the container starts and immediately exits: Postgres refuses to
+// initialise without POSTGRES_PASSWORD, and MySQL requires MYSQL_ROOT_PASSWORD.
+// The app connects with the same user/password later via ConnectionURL.
+func sidecarEnv(engine, user, pass, dbName string) []string {
+	switch engine {
+	case "postgres":
+		return []string{
+			"POSTGRES_USER=" + user,
+			"POSTGRES_PASSWORD=" + pass,
+			"POSTGRES_DB=" + dbName,
+		}
+	case "mysql":
+		return []string{
+			"MYSQL_ROOT_PASSWORD=" + pass,
+			"MYSQL_DATABASE=" + dbName,
+			"MYSQL_USER=" + user,
+			"MYSQL_PASSWORD=" + pass,
+		}
+	default:
+		return nil
+	}
+}
+
 // WaitForDatabase polls the DB's TCP port (5432/3306) until it accepts
 // connections, giving Postgres's first-boot init time to finish.
 func (o *Orchestrator) WaitForDatabase(ctx context.Context, sandboxID, containerID, engine string, timeout time.Duration) error {
@@ -200,4 +230,24 @@ func randomSecret(nBytes int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// ensureImage makes sure a sidecar image is present locally before ContainerCreate
+// runs. The Docker API does not auto-pull, so without this a first deploy on a
+// host that has never run MySQL/Postgres fails with "No such image".
+func (o *Orchestrator) ensureImage(ctx context.Context, ref string) error {
+	if _, _, err := o.docker.ImageInspectWithRaw(ctx, ref); err == nil {
+		return nil
+	} else if !client.IsErrNotFound(err) {
+		return fmt.Errorf("orchestrator: inspecting image %s: %w", ref, err)
+	}
+	rc, err := o.docker.ImagePull(ctx, ref, image.PullOptions{})
+	if err != nil {
+		return fmt.Errorf("orchestrator: pulling image %s: %w", ref, err)
+	}
+	defer rc.Close()
+	if _, err := io.Copy(io.Discard, rc); err != nil {
+		return fmt.Errorf("orchestrator: pulling image %s: %w", ref, err)
+	}
+	return nil
 }

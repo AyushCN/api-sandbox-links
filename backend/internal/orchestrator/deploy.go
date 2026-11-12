@@ -201,6 +201,11 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 	if err := d.maybeProvisionDatabase(ctx, sandbox, opts.DatabaseOverride, workDir); err != nil {
 		return markFailed(fmt.Errorf("deploy: provisioning sidecar database: %w", err))
 	}
+	// Starting the app before its database accepts connections makes the first
+	// request fail and leaves a "running" sandbox whose app crashed on boot.
+	if err := d.waitForSidecarDatabases(ctx, sandbox.ID); err != nil {
+		return markFailed(fmt.Errorf("deploy: sidecar database never became ready: %w", err))
+	}
 
 	buildLog := &bytes.Buffer{}
 	plan, err := d.orch.PlanAnalyze(ctx, workDir)
@@ -361,6 +366,29 @@ func (d *Deployer) maybeProvisionDatabase(ctx context.Context, sandbox *db.Sandb
 	return nil
 }
 
+// sidecarReadyTimeout is how long a fresh DB gets for first-boot init before the
+// deploy is failed and torn down.
+const sidecarReadyTimeout = 2 * time.Minute
+
+// waitForSidecarDatabases blocks until every sidecar owned by the sandbox
+// accepts TCP connections, so the app container never starts against a DB that
+// is still initialising.
+func (d *Deployer) waitForSidecarDatabases(ctx context.Context, sandboxID string) error {
+	dbs, err := d.store.ListSandboxDatabases(sandboxID)
+	if err != nil {
+		return err
+	}
+	for _, dbb := range dbs {
+		if dbb.ContainerID == "" {
+			return fmt.Errorf("sidecar %s has no container id", dbb.ID)
+		}
+		if err := d.orch.WaitForDatabase(ctx, sandboxID, dbb.ContainerID, dbb.Engine, sidecarReadyTimeout); err != nil {
+			return fmt.Errorf("%s sidecar %s: %w", dbb.Engine, dbb.ID, err)
+		}
+	}
+	return nil
+}
+
 // buildEnv assembles the container env: PORT plus the sandbox's decrypted env
 // vars. Sidecar DB connection strings are injected here too (Phase H) so app
 // code never has to hardcode a database URL.
@@ -391,6 +419,10 @@ func (d *Deployer) buildEnv(ctx context.Context, sandbox *db.Sandbox, port int) 
 			continue
 		}
 		envs = append(envs, "DATABASE_URL="+string(plain))
+		if dbb.Engine == "mysql" {
+			// Common MySQL clients and frameworks look for MYSQL_URL first.
+			envs = append(envs, "MYSQL_URL="+string(plain))
+		}
 		// Many apps read a DB via per-vendor env vars instead of DATABASE_URL
 		// (e.g. Go apps with godotenv using HOST/DBPORT/DBUSER/DBPASSWORD/DBNAME,
 		// or libpq's PGHOST/PGPORT/...). Inject all of them so a repo's own
