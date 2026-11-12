@@ -8,6 +8,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -26,31 +27,54 @@ import (
 // become healthy before giving up on the current request.
 const wakeTimeout = 90 * time.Second
 
+// wakeCall represents an in-flight wake operation shared across concurrent requests.
+type wakeCall struct {
+	done chan struct{}
+	err  error
+}
+
 // Gateway reverse-proxies sandbox subdomain traffic to the matching container
 // and performs on-demand wake-ups.
 type Gateway struct {
-	store  *db.Store
-	cache  *cache.Redis
-	orch   *orchestrator.Orchestrator
-	cfg    *config.Config
-	logger *slog.Logger
+	store   *db.Store
+	cache   *cache.Redis
+	orch    *orchestrator.Orchestrator
+	cfg     *config.Config
+	logger  *slog.Logger
+	limiter *IPRateLimiter
 
-	// waking guards per-sandbox wake-ups so two simultaneous requests to a
-	// sleeping sandbox don't start two containers.
+	// waking guards per-sandbox wake-ups so concurrent requests to a
+	// hibernated sandbox share a single wake operation and error outcome.
 	wakingMu sync.Mutex
-	waking   map[string]chan struct{}
+	waking   map[string]*wakeCall
 }
 
 // NewGateway builds the traffic gateway with its dependencies.
 func NewGateway(store *db.Store, cache *cache.Redis, orch *orchestrator.Orchestrator, cfg *config.Config, logger *slog.Logger) *Gateway {
-	return &Gateway{
-		store:  store,
-		cache:  cache,
-		orch:   orch,
-		cfg:    cfg,
-		logger: logger,
-		waking: map[string]chan struct{}{},
+	rps := 100
+	burst := 200
+	if cfg != nil {
+		if cfg.GatewayRateLimitRPS > 0 {
+			rps = cfg.GatewayRateLimitRPS
+		}
+		if cfg.GatewayRateLimitBurst > 0 {
+			burst = cfg.GatewayRateLimitBurst
+		}
 	}
+	return &Gateway{
+		store:   store,
+		cache:   cache,
+		orch:    orch,
+		cfg:     cfg,
+		logger:  logger,
+		limiter: NewIPRateLimiter(rps, burst),
+		waking:  map[string]*wakeCall{},
+	}
+}
+
+// Limiter returns the active IPRateLimiter instance for metrics and status inspection.
+func (g *Gateway) Limiter() *IPRateLimiter {
+	return g.limiter
 }
 
 // Handler returns the reverse-proxy HTTP handler for sandbox subdomains.
@@ -62,6 +86,20 @@ func (g *Gateway) Handler() http.Handler {
 // is hibernated, and proxies the request to the container over its private
 // network address.
 func (g *Gateway) serve(w http.ResponseWriter, r *http.Request) {
+	// 1. Rate limiting per client IP
+	cip := clientIP(r)
+	if g.limiter != nil && !g.limiter.Allow(cip) {
+		g.logger.Warn("gateway: rate limit exceeded", slog.String("client_ip", cip), slog.String("host", r.Host))
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "Rate limit exceeded. Please wait a moment.", http.StatusTooManyRequests)
+		return
+	}
+
+	// 2. Request body size guard
+	if g.cfg != nil && g.cfg.GatewayMaxBodyBytes > 0 && r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, g.cfg.GatewayMaxBodyBytes)
+	}
+
 	subdomain, err := g.subdomainFromHost(r.Host)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -93,7 +131,14 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request) {
 	if sandbox.Status == db.StatusHibernated {
 		if err := g.wake(r.Context(), sandbox); err != nil {
 			g.logger.Warn("gateway: wake failed", slog.String("sandbox", sandbox.ID), slog.String("err", err.Error()))
-			http.Error(w, "Sandbox failed to wake; try again in a moment.", http.StatusServiceUnavailable)
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				http.Error(w, "Sandbox timed out while waking up.", http.StatusGatewayTimeout)
+				return
+			}
+			http.Error(w, fmt.Sprintf("Sandbox failed to wake: %s", err.Error()), http.StatusServiceUnavailable)
 			return
 		}
 	}
@@ -130,38 +175,62 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request) {
 }
 
 // wake restarts a hibernated container and waits for it to be healthy. It is
-// concurrency-safe: the first caller for a sandbox performs the wake; any
-// other caller blocks on a shared "done" channel, then proceeds to proxy.
+// concurrency-safe: concurrent requests to the same hibernated sandbox share
+// a single wake operation, and the resulting error or success is broadcast
+// to all awaiting callers.
 func (g *Gateway) wake(ctx context.Context, sandbox *db.Sandbox) error {
 	g.wakingMu.Lock()
-	if done, ok := g.waking[sandbox.ID]; ok {
+	if call, ok := g.waking[sandbox.ID]; ok {
 		g.wakingMu.Unlock()
-		<-done
-		return nil
+		select {
+		case <-call.done:
+			return call.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
-	done := make(chan struct{})
-	g.waking[sandbox.ID] = done
+
+	call := &wakeCall{
+		done: make(chan struct{}),
+	}
+	g.waking[sandbox.ID] = call
 	g.wakingMu.Unlock()
 
-	defer func() {
+	go func() {
+		// Run actual wake with a detached context bounded by wakeTimeout
+		// so an individual caller disconnecting does not abort an in-flight wake for others.
+		wakeCtx, cancel := context.WithTimeout(context.Background(), wakeTimeout)
+		defer cancel()
+
+		err := g.executeWake(wakeCtx, sandbox)
+
 		g.wakingMu.Lock()
+		call.err = err
 		delete(g.waking, sandbox.ID)
-		close(done)
+		close(call.done)
 		g.wakingMu.Unlock()
 	}()
 
+	select {
+	case <-call.done:
+		return call.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (g *Gateway) executeWake(ctx context.Context, sandbox *db.Sandbox) error {
+	start := time.Now()
 	if err := g.orch.StartContainer(ctx, sandbox.ContainerID); err != nil {
 		return fmt.Errorf("starting container: %w", err)
 	}
 
-	wakeCtx, cancel := context.WithTimeout(ctx, wakeTimeout)
-	defer cancel()
-	ip, err := g.orch.ContainerIP(wakeCtx, sandbox.ContainerID, "sandbox_"+sandbox.ID[:8])
+	ip, err := g.orch.ContainerIP(ctx, sandbox.ContainerID, "sandbox_"+sandbox.ID[:8])
 	if err != nil {
-		return err
+		return fmt.Errorf("resolving container IP: %w", err)
 	}
-	if err := g.orch.WaitHealthy(wakeCtx, sandbox.ContainerID, ip, sandbox.InternalPort, wakeTimeout); err != nil {
-		return err
+	if err := g.orch.WaitHealthy(ctx, sandbox.ContainerID, ip, sandbox.InternalPort, wakeTimeout); err != nil {
+		return fmt.Errorf("waiting for healthy container: %w", err)
 	}
 
 	// The sandbox is up again; it is not hibernated anymore. Restart its stats
@@ -170,6 +239,10 @@ func (g *Gateway) wake(ctx context.Context, sandbox *db.Sandbox) error {
 	if err := g.store.UpdateSandbox(sandbox.ID, map[string]any{"status": string(db.StatusRunning)}); err != nil {
 		return fmt.Errorf("marking running: %w", err)
 	}
+	g.logger.Info("gateway: sandbox woke successfully",
+		slog.String("sandbox", sandbox.ID),
+		slog.Duration("elapsed", time.Since(start)),
+	)
 	return nil
 }
 

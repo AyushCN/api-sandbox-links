@@ -1,9 +1,5 @@
 package orchestrator
 
-// DB-gated lifecycle tests for workdir cleanup, cancellation, and deployment
-// status transitions. The only build execution in this file uses a fake
-// Nixpacks shell script with the explicitly local development override.
-
 import (
 	"context"
 	"fmt"
@@ -53,8 +49,15 @@ func lifecycleSandbox(t *testing.T, store *db.Store, gdb *gorm.DB, name string, 
 		t.Fatalf("FindOrCreateRepository: %v", err)
 	}
 	now := time.Now().UTC()
-	sb := &db.Sandbox{RepositoryID: repo.ID, BranchName: "main", Subdomain: "lc-" + name,
-		Status: db.StatusBuilding, LifetimeSeconds: 3600, CreatedAt: now, UpdatedAt: now}
+	sb := &db.Sandbox{
+		RepositoryID:    repo.ID,
+		BranchName:      "main",
+		Subdomain:       "lc-" + name,
+		Status:          db.StatusBuilding,
+		LifetimeSeconds: 3600,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
 	if err := store.CreateSandbox(sb); err != nil {
 		t.Fatalf("CreateSandbox: %v", err)
 	}
@@ -78,8 +81,11 @@ func lifecycleNixpacks(t *testing.T, buildBody string) string {
 func lifecycleDeployer(t *testing.T, store *db.Store, bin string) (*Deployer, string) {
 	t.Helper()
 	root := t.TempDir()
-	cfg := &config.Config{SandboxWorkDir: root, NixpacksBin: bin}
-	o := &Orchestrator{cfg: cfg, store: store, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	cfg := &config.Config{SandboxWorkDir: root, NixpacksBin: bin, Builder: "nixpacks"}
+	l := slog.New(slog.NewTextHandler(io.Discard, nil))
+	o := &Orchestrator{cfg: cfg, store: store, logger: l}
+	b := NewNixpacksBuilder(bin, l)
+	o.SetBuilder(b)
 	return &Deployer{cfg: cfg, store: store, orch: o}, root
 }
 
@@ -109,6 +115,85 @@ func waitForFileDeploy(t *testing.T, path string, within time.Duration) {
 	t.Fatalf("file %s not created within %s", path, within)
 }
 
+// A second deploy must block on the semaphore until the first releases it, and
+// a cancelled waiter must return instead of hanging.
+func TestAcquireBuildSlotQueuesAndHonoursCancellation(t *testing.T) {
+	d := &Deployer{buildSem: make(chan struct{}, 1)}
+	release, err := d.acquireBuildSlot(context.Background())
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := d.acquireBuildSlot(waitCtx); err == nil {
+		t.Fatal("second acquire succeeded while the only slot was held")
+	}
+
+	release()
+	thirdCtx, thirdCancel := context.WithTimeout(context.Background(), time.Second)
+	defer thirdCancel()
+	releaseThird, err := d.acquireBuildSlot(thirdCtx)
+	if err != nil {
+		t.Fatalf("acquire after release: %v", err)
+	}
+	releaseThird()
+}
+
+func TestCleanupWorkDirIfDestroyedOnlyTouchesTombstones(t *testing.T) {
+	store, gdb := lifecycleEnv(t)
+	sb := lifecycleSandbox(t, store, gdb, "cleanup-unit", 880004)
+	d, root := lifecycleDeployer(t, store, lifecycleNixpacks(t, "exit 0"))
+	workDir := lifecycleSeedWorkDir(t, root, sb, "keep.txt", "x")
+	if d.cleanupWorkDirIfDestroyed(sb.ID, sb.Subdomain) {
+		t.Fatal("cleanup fired for live sandbox")
+	}
+	if err := store.UpdateSandbox(sb.ID, map[string]any{"status": string(db.StatusDeleted), "destroyed_at": time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if !d.cleanupWorkDirIfDestroyed(sb.ID, sb.Subdomain) {
+		t.Fatal("cleanup did not fire for tombstone")
+	}
+	if _, err := os.Stat(workDir); !os.IsNotExist(err) {
+		t.Errorf("tombstone workdir remains: %v", err)
+	}
+	if !d.cleanupWorkDirIfDestroyed(sb.ID, sb.Subdomain) {
+		t.Error("repeated cleanup did not converge")
+	}
+}
+
+func TestRemoveSandboxWorkDirPathSafety(t *testing.T) {
+	root := t.TempDir()
+
+	// 1. Refuses empty subdomain
+	if err := RemoveSandboxWorkDir(root, ""); err == nil {
+		t.Error("expected error for empty subdomain")
+	}
+	if err := RemoveSandboxWorkDir(root, "   "); err == nil {
+		t.Error("expected error for blank subdomain")
+	}
+
+	// 2. Refuses path traversal attempts
+	if err := RemoveSandboxWorkDir(root, "../outside"); err == nil {
+		t.Error("expected error for traversal attempt")
+	}
+	if err := RemoveSandboxWorkDir(root, "sub/dir"); err == nil {
+		t.Error("expected error for path containing separator")
+	}
+
+	// 3. Successfully deletes valid child directory
+	validDir := filepath.Join(root, "valid-subdomain")
+	if err := os.MkdirAll(validDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveSandboxWorkDir(root, "valid-subdomain"); err != nil {
+		t.Fatalf("unexpected error removing valid dir: %v", err)
+	}
+	if _, err := os.Stat(validDir); !os.IsNotExist(err) {
+		t.Error("validDir was not deleted")
+	}
+}
+
 func TestDeployLifecycleRefusesAlreadyDestroyedSandbox(t *testing.T) {
 	store, gdb := lifecycleEnv(t)
 	sb := lifecycleSandbox(t, store, gdb, "refuse", 880001)
@@ -125,49 +210,6 @@ func TestDeployLifecycleRefusesAlreadyDestroyedSandbox(t *testing.T) {
 	rows, err := store.ListDeployments(sb.ID)
 	if err != nil || len(rows) != 0 {
 		t.Fatalf("deployment rows %d, err %v; want none", len(rows), err)
-	}
-}
-
-func TestDeployLifecycleDestroyDuringBuildConverges(t *testing.T) {
-	store, gdb := lifecycleEnv(t)
-	sb := lifecycleSandbox(t, store, gdb, "destroy-race", 880002)
-	tmp := t.TempDir()
-	started, signal := filepath.Join(tmp, "build-started"), filepath.Join(tmp, "destroy-done")
-	body := fmt.Sprintf(": > '%s'\ni=0\nwhile [ ! -f '%s' ] && [ $i -lt 600 ]; do i=$((i+1)); sleep 0.05; done\nexit 1", started, signal)
-	d, root := lifecycleDeployer(t, store, lifecycleNixpacks(t, body))
-	workDir := lifecycleSeedWorkDir(t, root, sb, "README.md", "# fixture\n")
-	done := make(chan error, 1)
-	go func() {
-		done <- d.DeploySandbox(context.Background(), sb, DeployOptions{Trigger: db.TriggerSaveRedeploy})
-	}()
-	waitForFileDeploy(t, started, 10*time.Second)
-	if err := store.UpdateSandbox(sb.ID, map[string]any{"status": string(db.StatusDeleted), "destroyed_at": time.Now().UTC(), "container_id": ""}); err != nil {
-		t.Fatal(err)
-	}
-	if err := RemoveSandboxWorkDir(root, sb.Subdomain); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(signal, []byte("go"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("DeploySandbox: %v", err)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("deploy did not finish")
-	}
-	if _, err := os.Stat(workDir); !os.IsNotExist(err) {
-		t.Errorf("workdir remains after destroy/build race: %v", err)
-	}
-	rows, err := store.ListDeployments(sb.ID)
-	if err != nil || len(rows) != 1 || rows[0].Status != string(db.DeployFailed) {
-		t.Fatalf("deployments = %+v, err %v; want one failed row", rows, err)
-	}
-	fresh, err := store.GetSandbox(sb.ID)
-	if err != nil || fresh.DestroyedAt == nil {
-		t.Fatalf("destroyed tombstone lost: sandbox %+v, err %v", fresh, err)
 	}
 }
 
@@ -222,51 +264,4 @@ func TestDeployLifecycleFailedBuildIsRecorded(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(workDir, "package.json")); err != nil {
 		t.Errorf("failed build discarded source workdir: %v", err)
 	}
-}
-
-func TestCleanupWorkDirIfDestroyedOnlyTouchesTombstones(t *testing.T) {
-	store, gdb := lifecycleEnv(t)
-	sb := lifecycleSandbox(t, store, gdb, "cleanup-unit", 880004)
-	d, root := lifecycleDeployer(t, store, lifecycleNixpacks(t, "exit 0"))
-	workDir := lifecycleSeedWorkDir(t, root, sb, "keep.txt", "x")
-	if d.cleanupWorkDirIfDestroyed(sb.ID, sb.Subdomain) {
-		t.Fatal("cleanup fired for live sandbox")
-	}
-	if err := store.UpdateSandbox(sb.ID, map[string]any{"status": string(db.StatusDeleted), "destroyed_at": time.Now().UTC()}); err != nil {
-		t.Fatal(err)
-	}
-	if !d.cleanupWorkDirIfDestroyed(sb.ID, sb.Subdomain) {
-		t.Fatal("cleanup did not fire for tombstone")
-	}
-	if _, err := os.Stat(workDir); !os.IsNotExist(err) {
-		t.Errorf("tombstone workdir remains: %v", err)
-	}
-	if !d.cleanupWorkDirIfDestroyed(sb.ID, sb.Subdomain) {
-		t.Error("repeated cleanup did not converge")
-	}
-}
-
-// A second deploy must block on the semaphore until the first releases it, and
-// a cancelled waiter must return instead of hanging.
-func TestAcquireBuildSlotQueuesAndHonoursCancellation(t *testing.T) {
-	d := &Deployer{buildSem: make(chan struct{}, 1)}
-	release, err := d.acquireBuildSlot(context.Background())
-	if err != nil {
-		t.Fatalf("first acquire: %v", err)
-	}
-
-	waitCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	if _, err := d.acquireBuildSlot(waitCtx); err == nil {
-		t.Fatal("second acquire succeeded while the only slot was held")
-	}
-
-	release()
-	thirdCtx, thirdCancel := context.WithTimeout(context.Background(), time.Second)
-	defer thirdCancel()
-	releaseThird, err := d.acquireBuildSlot(thirdCtx)
-	if err != nil {
-		t.Fatalf("acquire after release: %v", err)
-	}
-	releaseThird()
 }

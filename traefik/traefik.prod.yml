@@ -1,0 +1,48 @@
+# Production static configuration for Traefik edge reverse proxy.
+#
+# Provides wildcard TLS termination using Let's Encrypt ACME with DNS-01 challenge.
+# Pluggable DNS provider configured via environment variables (default: cloudflare).
+
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+
+log:
+  level: INFO
+  format: json
+
+accessLog:
+  format: json
+  filters:
+    statusCodes:
+      - "400-599"
+
+entryPoints:
+  web:
+    address: ":80"
+  websecure:
+    address: ":443"
+
+providers:
+  docker:
+    exposedByDefault: false
+  file:
+    filename: "/etc/traefik/dynamic.prod.yml"
+    watch: true
+
+certificatesResolvers:
+  le-wildcard:
+    acme:
+      email: "${ACME_EMAIL}"
+      storage: "/etc/traefik/acme/acme.json"
+      # To test against staging before production limits:
+      # caServer: "https://acme-staging-v02.api.letsencrypt.org/directory"
+      dnsChallenge:
+        # Default is cloudflare; can be overridden via ACME_DNS_PROVIDER
+        # (e.g. route53, digitalocean, namecheap, ovh, etc.)
+        provider: "${ACME_DNS_PROVIDER:-cloudflare}"
+        delayBeforeCheck: 30
+        resolvers:
+          - "1.1.1.1:53"
+          - "8.8.8.8:53"
+
