@@ -1,0 +1,35 @@
+[Unit]
+Description=API Sandbox Links Backend Control Plane
+Documentation=https://github.com/AyushCN/api-sandbox-links
+After=network.target docker.service postgresql.service redis.service
+Wants=docker.service postgresql.service redis.service
+
+[Service]
+Type=simple
+User=sandbox
+Group=sandbox
+WorkingDirectory=/opt/api-sandbox-links
+EnvironmentFile=/opt/api-sandbox-links/.env
+ExecStart=/opt/api-sandbox-links/bin/server
+Restart=always
+RestartSec=5s
+
+# File descriptor and process capacity
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Structured stdout logging to journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=api-sandbox-backend
+
+# Security & Isolation
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -598,11 +598,48 @@ func (s *Store) DeleteEnvVarsNotIn(sandboxID string, keep []string) (int64, erro
 	return res.RowsAffected, nil
 }
 
-// Ping verifies Postgres is reachable; used by readiness and the doctor.
-func (s *Store) Ping(ctx context.Context) error {
-	sqlDB, err := s.db.DB()
-	if err != nil {
-		return err
+// ---- build queue recovery & reconciliation ------------------------------
+
+// RecoverStuckDeployments reconciles in-flight deployments and building sandboxes
+// after a worker or backend process restart, or after exceeding a heartbeat timeout.
+// It marks any pending/building deployment as failed and transitions any
+// queued/building sandbox to failed.
+func (s *Store) RecoverStuckDeployments(olderThan time.Duration, reason string) (int64, error) {
+	if reason == "" {
+		reason = "build aborted: worker process restarted while build was in progress"
 	}
-	return sqlDB.PingContext(ctx)
+	now := time.Now().UTC()
+
+	dQuery := s.db.Model(&Deployment{}).Where("status IN ?", []string{string(DeployPending), string(DeployBuilding)})
+	if olderThan > 0 {
+		cutoff := now.Add(-olderThan)
+		dQuery = dQuery.Where("started_at < ?", cutoff)
+	}
+
+	res := dQuery.Updates(map[string]any{
+		"status":      string(DeployFailed),
+		"log_excerpt": reason,
+		"finished_at": now,
+	})
+	if res.Error != nil {
+		return 0, fmt.Errorf("db: recovering stuck deployments: %w", res.Error)
+	}
+	affected := res.RowsAffected
+
+	sbQuery := s.db.Model(&Sandbox{}).
+		Where("status IN ? AND destroyed_at IS NULL", []SandboxStatus{StatusQueued, StatusBuilding})
+	if olderThan > 0 {
+		cutoff := now.Add(-olderThan)
+		sbQuery = sbQuery.Where("updated_at < ?", cutoff)
+	}
+	if err := sbQuery.Updates(map[string]any{
+		"status": string(StatusFailed),
+	}).Error; err != nil {
+		return affected, fmt.Errorf("db: recovering stuck sandboxes: %w", err)
+	}
+
+	return affected, nil
 }
+
+// UpsertEnvVar inserts or replaces one secret env var for a sandbox (values
+// stored encrypted; encrypt before calling).
