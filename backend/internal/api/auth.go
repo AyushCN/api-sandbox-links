@@ -5,6 +5,9 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -21,6 +24,12 @@ import (
 // GitHub numeric ID; decryption doubles as authenticity (attacker-crafted
 // cookies fail authentication). See secret.Box.
 const oauthStateCookie = "asl_session"
+
+// oauthStateCookieName holds the anti-CSRF value minted at sign-in start. It is
+// short-lived and separate from the session cookie.
+const oauthStateCookieName = "asl_oauth_state"
+
+const oauthStateTTL = 10 * time.Minute
 
 // devUser is used only when OAuth is not configured (DevAuth mode) so the
 // deploy loop is testable end-to-end without a GitHub App.
@@ -59,9 +68,51 @@ func (s *Server) handleAuthStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GitHub OAuth is not configured (GITHUB_CLIENT_ID missing). DevAuth is active; try the health endpoint.", http.StatusNotImplemented)
 		return
 	}
-	state := fmt.Sprintf("%d", time.Now().UnixNano())
+	state, err := randomOAuthState()
+	if err != nil {
+		http.Error(w, "could not start sign-in", http.StatusInternalServerError)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     oauthStateCookieName,
+		Value:    state,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   s.secureCookies(),
+		MaxAge:   int(oauthStateTTL.Seconds()),
+	})
 	url := cfg.AuthCodeURL(state, oauth2.AccessTypeOffline)
 	http.Redirect(w, r, url, http.StatusFound)
+}
+
+// randomOAuthState returns an unguessable anti-CSRF state value.
+func randomOAuthState() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// secureCookies ties the Secure flag to the environment rather than to
+// r.TLS: behind Traefik the backend sees plain HTTP even when the browser used
+// HTTPS, so r.TLS alone would silently omit Secure in production.
+func (s *Server) secureCookies() bool {
+	return s.cfg.AppEnv != "development"
+}
+
+func (s *Server) clearOAuthState(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     oauthStateCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   s.secureCookies(),
+		MaxAge:   -1,
+		Expires:  time.Unix(0, 0),
+	})
 }
 
 // handleAuthCallback exchanges the code, fetches the GitHub profile, upserts
@@ -72,6 +123,16 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "OAuth not configured", http.StatusNotImplemented)
 		return
 	}
+	state := r.URL.Query().Get("state")
+	stateCookie, stateErr := r.Cookie(oauthStateCookieName)
+	if stateErr != nil || state == "" || subtle.ConstantTimeCompare([]byte(state), []byte(stateCookie.Value)) != 1 {
+		s.clearOAuthState(w)
+		http.Error(w, "invalid OAuth state", http.StatusBadRequest)
+		return
+	}
+	// One-shot: the state is consumed whether or not the exchange succeeds.
+	s.clearOAuthState(w)
+
 	code := r.URL.Query().Get("code")
 	if code == "" {
 		http.Error(w, "missing OAuth code", http.StatusBadRequest)
@@ -122,7 +183,7 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure: r.TLS != nil,
+		Secure:   s.secureCookies(),
 		MaxAge:   30 * 24 * 3600, // 30 days
 	})
 	http.Redirect(w, r, s.cfg.FrontendURL+"/dashboard?authed=1", http.StatusFound)
@@ -161,7 +222,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure: r.TLS != nil,
+		Secure:   s.secureCookies(),
 		MaxAge:   -1,
 		Expires:  time.Unix(0, 0),
 	})

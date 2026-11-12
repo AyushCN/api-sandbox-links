@@ -53,9 +53,13 @@ type Config struct {
 	// NixpacksBin is the path to the nixpacks CLI binary.
 	NixpacksBin string
 
-	// DevAuth, when true (default if GITHUB_CLIENT_ID is unset), lets requests
+	// AppEnv is "development" (default) or "production". Production requires
+	// real OAuth credentials and disables DevAuth.
+	AppEnv string
+
+	// DevAuth, when true AND AppEnv is not production, lets requests
 	// authenticate with a fake GitHub identity so the deploy loop is testable
-	// without OAuth round-trips.
+	// without OAuth round-trips. It is opt-in; being unset means off.
 	DevAuth bool
 
 	// MaxLifetimeSeconds caps how far expires_at may be extended from original
@@ -87,7 +91,13 @@ func Load() (*Config, error) {
 	// Load .env only for local dev; it is a no-op when the file is absent.
 	_ = godotenv.Load()
 
+	appEnv := envDefault("APP_ENV", "development")
+	devAuth, err := envBool("DEV_AUTH", false)
+	if err != nil {
+		return nil, err
+	}
 	cfg := &Config{
+		AppEnv:                    appEnv,
 		DatabaseURL:               os.Getenv("DATABASE_URL"),
 		RedisURL:                  os.Getenv("REDIS_URL"),
 		GitHubClientID:            os.Getenv("GITHUB_CLIENT_ID"),
@@ -105,7 +115,9 @@ func Load() (*Config, error) {
 		MaxActiveSandboxesPerUser: envIntDefault("MAX_ACTIVE_SANDBOXES_PER_USER", 3),
 		MaxRunningSandboxes:       envIntDefault("MAX_RUNNING_SANDBOXES", 6),
 		BuildConcurrency:          envIntDefault("BUILD_CONCURRENCY", 2),
-		DevAuth:                   os.Getenv("GITHUB_CLIENT_ID") == "",
+		// DevAuth is opt-in and can never be enabled in production, even if the
+		// flag is set. Otherwise a forgotten DEV_AUTH=true would ship a bypass.
+		DevAuth: devAuth && appEnv != "production",
 	}
 
 	if err := cfg.decryptKey(); err != nil {
@@ -117,6 +129,9 @@ func Load() (*Config, error) {
 	}
 	if len(cfg.EncryptionKey) == 0 {
 		return nil, fmt.Errorf("config: SECRETS_ENCRYPTION_KEY must be a base64-encoded 32-byte key")
+	}
+	if cfg.AppEnv == "production" && (cfg.GitHubClientID == "" || cfg.GitHubClientSecret == "") {
+		return nil, fmt.Errorf("config: APP_ENV=production requires GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET")
 	}
 	// Abuse-control bounds: a zero or negative limit would either lock every
 	// user out (0) or disable the control entirely, so refuse to boot.
@@ -154,6 +169,18 @@ func envDefault(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func envBool(key string, fallback bool) (bool, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("config: %s must be true or false, got %q", key, v)
+	}
+	return b, nil
 }
 
 func envIntDefault(key string, fallback int) int {
