@@ -93,6 +93,12 @@ func run() error {
 		return fmt.Errorf("main: creating sandbox work dir: %w", err)
 	}
 
+	// Docker and the database can disagree after an unclean shutdown. Reconcile
+	// before any worker or request can observe the stale state.
+	if err := orch.ReconcileStartup(ctx); err != nil {
+		logger.Warn("startup reconciliation failed", slog.String("err", err.Error()))
+	}
+
 	// --- Background workers ----------------------------------------------
 	// Three reapers over sandbox rows, kept strictly separate (idle =
 	// reversible, expiry = irreversible, warnings = notifications), plus the

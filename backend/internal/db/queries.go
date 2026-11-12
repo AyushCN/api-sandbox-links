@@ -286,6 +286,17 @@ func (s *Store) ListActiveSandboxes() ([]*Sandbox, error) {
 	return out, nil
 }
 
+// ListAllSandboxes returns every row, including destroyed tombstones. Startup
+// reconciliation uses it to tell an orphaned Docker resource (no row at all)
+// apart from one whose sandbox is already terminal.
+func (s *Store) ListAllSandboxes() ([]*Sandbox, error) {
+	var out []*Sandbox
+	if err := s.db.Find(&out).Error; err != nil {
+		return nil, fmt.Errorf("db: listing all sandboxes: %w", err)
+	}
+	return out, nil
+}
+
 // ListDuedExpiredSandboxes finds non-destroyed sandboxes whose deadline has
 // passed. This is the only query the destroyer worker makes, so it stays on
 // the partial index from the schema.
