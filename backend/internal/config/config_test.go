@@ -28,8 +28,8 @@ func TestConfigDefaults(t *testing.T) {
 		t.Fatalf("expected Load to succeed with valid minimal env, got %v", err)
 	}
 
-	if cfg.Builder != "nixpacks" {
-		t.Errorf("expected default Builder to be 'nixpacks', got %q", cfg.Builder)
+	if cfg.Builder != "railpack" {
+		t.Errorf("expected default Builder to be 'railpack', got %q", cfg.Builder)
 	}
 	if cfg.NixpacksBin != "nixpacks" {
 		t.Errorf("expected default NixpacksBin to be 'nixpacks', got %q", cfg.NixpacksBin)
@@ -61,6 +61,12 @@ func TestConfigBuilderSelection(t *testing.T) {
 		expected    string
 		expectError bool
 	}{
+		{
+			name:        "empty builder defaults to railpack",
+			builderEnv:  "",
+			expected:    "railpack",
+			expectError: false,
+		},
 		{
 			name:        "explicit nixpacks",
 			builderEnv:  "nixpacks",

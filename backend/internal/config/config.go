@@ -50,8 +50,8 @@ type Config struct {
 	// <subdomain>.sandbox.localhost.
 	SandboxBaseDomain string
 
-	// Builder selects the container build engine ("nixpacks", "railpack").
-	// Defaults to "nixpacks".
+	// Builder selects the container build engine ("railpack", "nixpacks").
+	// Defaults to "railpack".
 	Builder string
 	// NixpacksBin is the path to the nixpacks CLI binary.
 	NixpacksBin string
@@ -121,7 +121,7 @@ func Load() (*Config, error) {
 		GatewayPort:               envIntDefault("GATEWAY_PORT", 8090),
 		FrontendURL:               envDefault("FRONTEND_URL", "http://localhost:3000"),
 		SandboxBaseDomain:         envDefault("SANDBOX_BASE_DOMAIN", "sandbox.localhost"),
-		Builder:                   strings.ToLower(envDefault("BUILDER", "nixpacks")),
+		Builder:                   strings.ToLower(envDefault("BUILDER", "railpack")),
 		NixpacksBin:               envDefault("NIXPACKS_BIN", "nixpacks"),
 		RailpackBin:               envDefault("RAILPACK_BIN", "railpack"),
 		BuildKitHost:              envDefault("BUILDKIT_HOST", "unix:///var/run/buildkit/buildkitd.sock"),

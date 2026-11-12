@@ -79,17 +79,19 @@ func setupSmokeEnv(t *testing.T) *smokeEnv {
 	// 2. Builder CLI check
 	builderName := strings.ToLower(os.Getenv("ASL_SMOKE_BUILDER"))
 	if builderName == "" {
-		builderName = "nixpacks"
+		builderName = "railpack"
 	}
-	builderBin := os.Getenv("NIXPACKS_BIN")
-	if builderBin == "" {
-		builderBin = "nixpacks"
-	}
+	var builderBin string
 	if builderName == "railpack" {
 		if rb := os.Getenv("RAILPACK_BIN"); rb != "" {
 			builderBin = rb
 		} else {
 			builderBin = "railpack"
+		}
+	} else {
+		builderBin = os.Getenv("NIXPACKS_BIN")
+		if builderBin == "" {
+			builderBin = "nixpacks"
 		}
 	}
 	if _, err := exec.LookPath(builderBin); err != nil {
@@ -213,7 +215,7 @@ func setupSmokeEnv(t *testing.T) *smokeEnv {
 
 // TestSmokeDeployNodeJSSample runs a full end-to-end smoke test:
 // 1. Clones heroku/node-js-sample (shallow).
-// 2. Analyzes build plan with configured builder (default nixpacks).
+// 2. Analyzes build plan with configured builder (default railpack).
 // 3. Compiles container image and runs container on private bridge network.
 // 4. Probes and discovers listening port (overriding defaults if needed).
 // 5. Validates HTTP response over gateway proxy.
@@ -408,4 +410,3 @@ func TestTCPPortConnectivity(t *testing.T) {
 	}
 	_ = conn.Close()
 }
-

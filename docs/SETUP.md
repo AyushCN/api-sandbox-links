@@ -16,13 +16,13 @@ you started with.
 ## 1. Prerequisites
 
 - Docker engine running (needed for builder image compilation and sandbox containers).
-- **Nixpacks (Default builder)**: `curl -sSL https://nixpacks.com/install.sh | bash`, then confirm
-  with `nixpacks --version`. Point the backend at it via `NIXPACKS_BIN` (defaults
-  to `nixpacks` on PATH).
-- **Railpack (Alternative builder, optional)**:
+- **Railpack (Default builder)**:
   `curl -sSL https://railpack.com/install.sh | sh`, then confirm with `railpack --version`.
-  Set `BUILDER=railpack` in `.env` and run the BuildKit service via `docker-compose.dev.yml`
-  (`BUILDKIT_HOST=tcp://127.0.0.1:1234`).
+  Point the backend at it via `RAILPACK_BIN` (defaults to `railpack` on PATH).
+  Requires BuildKit running on `BUILDKIT_HOST` (defaults to `tcp://127.0.0.1:1234`, provided by `docker-compose.dev.yml`).
+- **Nixpacks (Supported deprecated fallback)**:
+  `curl -sSL https://nixpacks.com/install.sh | bash`, then confirm with `nixpacks --version`.
+  Configure `BUILDER=nixpacks` in `.env` if needed during the deprecation transition. Point the backend at it via `NIXPACKS_BIN` (defaults to `nixpacks` on PATH).
 - Redis is provided by compose; the host's own `:6379`, if any, is never used.
 
 ## 2. Environment — `.env`
@@ -62,7 +62,7 @@ docker compose -f docker-compose.dev.yml up -d
 | Postgres | `5432` | platform metadata (`user:pass`, db `sandbox_platform`) |
 | Redis | `6380` | hot state (idle TTL keys, newest live metric per sandbox) |
 | Traefik | `80`, `8081` | sandbox edge (`:80`), dashboard (`:8081`) |
-| BuildKit | `1234` | optional BuildKit daemon for Railpack builds (`BUILDER=railpack`) |
+| BuildKit | `1234` | BuildKit daemon for Railpack builds (default builder) |
 
 Traefik runs with the Docker provider **disabled** and a file-provider wildcard
 router (`traefik/dynamic.yml`) that sends every `*.sandbox.localhost` host to the

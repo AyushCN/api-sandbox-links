@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
@@ -14,20 +15,21 @@ import (
 func TestNewBuilderFactory(t *testing.T) {
 	logger := slog.Default()
 
-	t.Run("default builder is nixpacks", func(t *testing.T) {
+	t.Run("default builder is railpack", func(t *testing.T) {
 		cfg := &config.Config{
-			Builder:     "",
-			NixpacksBin: "nixpacks",
+			Builder:      "",
+			RailpackBin:  "railpack",
+			BuildKitHost: "tcp://127.0.0.1:1234",
 		}
 		b, err := NewBuilder(cfg, logger)
 		if err != nil {
 			t.Fatalf("unexpected error creating default builder: %v", err)
 		}
-		if b.Name() != "nixpacks" {
-			t.Errorf("expected builder name 'nixpacks', got %q", b.Name())
+		if b.Name() != "railpack" {
+			t.Errorf("expected builder name 'railpack', got %q", b.Name())
 		}
-		if _, ok := b.(*NixpacksBuilder); !ok {
-			t.Errorf("expected *NixpacksBuilder, got %T", b)
+		if _, ok := b.(*RailpackBuilder); !ok {
+			t.Errorf("expected *RailpackBuilder, got %T", b)
 		}
 	})
 
@@ -258,7 +260,9 @@ func (m *mockBuilder) PlanAnalyze(ctx context.Context, dir string) (*BuildPlan, 
 func (m *mockBuilder) BuildImage(ctx context.Context, dir, name string, progress io.Writer) (string, error) {
 	m.buildCalled = true
 	if progress != nil {
-		_, _ = progress.Write([]byte("build output"))
+		if buf, ok := progress.(*bytes.Buffer); !ok || buf != nil {
+			_, _ = progress.Write([]byte("build output"))
+		}
 	}
 	return m.imageTag, m.buildErr
 }
@@ -482,3 +486,42 @@ func TestParseRailpackPlanGoldenFixtures(t *testing.T) {
 	})
 }
 
+func TestBuilderFallbackAndRejection(t *testing.T) {
+	logger := slog.Default()
+
+	t.Run("unsupported builders rejected with clear error", func(t *testing.T) {
+		unsupported := []string{"dockerfile", "pack", "buildpacks", "kaniko", "invalid"}
+		for _, name := range unsupported {
+			cfg := &config.Config{Builder: name}
+			_, err := NewBuilder(cfg, logger)
+			if err == nil {
+				t.Errorf("expected error for unsupported builder %q, got nil", name)
+			}
+			if !strings.Contains(err.Error(), "unsupported builder engine") {
+				t.Errorf("expected 'unsupported builder engine' in error for %q, got: %v", name, err)
+			}
+		}
+	})
+
+	t.Run("railpack build failure does not silently fallback to nixpacks", func(t *testing.T) {
+		orch := &Orchestrator{}
+		railpackFail := &mockBuilder{
+			name:     "railpack",
+			plan:     &BuildPlan{Builder: "railpack", InternalPort: 3000},
+			buildErr: errors.New("railpack builder: compilation failed: syntax error"),
+		}
+		orch.SetBuilder(railpackFail)
+
+		// Ensure build failure is propagated directly and does not alter the builder engine.
+		_, err := orch.BuildImage(context.Background(), "/tmp/work", "tag", nil)
+		if err == nil {
+			t.Fatal("expected build failure, got nil")
+		}
+		if !strings.Contains(err.Error(), "railpack builder: compilation failed") {
+			t.Fatalf("expected railpack failure to be returned verbatim, got: %v", err)
+		}
+		if orch.Builder().Name() != "railpack" {
+			t.Fatalf("builder changed silently from railpack to %q", orch.Builder().Name())
+		}
+	})
+}

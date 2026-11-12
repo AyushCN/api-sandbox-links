@@ -31,7 +31,7 @@ Paste `https://github.com/heroku/node-js-sample` (branch `master`) in the dashbo
 ## Architecture at a glance
 
 ```
-Browser ── :3000 (Next.js) ──> API :8080 (chi, PostgreSQL, Redis) ──> Docker (nixpacks images, per-sandbox containers)
+Browser ── :3000 (Next.js) ──> API :8080 (chi, PostgreSQL, Redis) ──> Docker (railpack/nixpacks images, per-sandbox containers)
 Browser ── :80 (Traefik file provider) ──> gateway :8090 ──> sandbox container (wake-on-request before forwarding)
 Browser ── ws :8080 ──> live logs (xterm) + live metrics (recharts)
 ```
@@ -61,4 +61,4 @@ routes), so they can be verified quickly when behaviour changes.
 
 ## Status
 
-Phase A–G implemented and verified end-to-end in dev: create → clone → nixpacks build → container running → public URL responds → hibernate/wake → file edit → save-redeploy → commit/push wired (push requires a real GitHub token from OAuth sign-in).
+Phase A–G implemented and verified end-to-end in dev: create → clone → build (Railpack default) → container running → public URL responds → hibernate/wake → file edit → save-redeploy → commit/push wired (push requires a real GitHub token from OAuth sign-in).

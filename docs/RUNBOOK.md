@@ -84,16 +84,9 @@ sudo systemctl enable --now docker
 
 ## 3. Pluggable Builder Setup
 
-API Sandbox Links supports two build orchestrators: **Nixpacks** (default) and **Railpack** (modern, BuildKit-backed).
+API Sandbox Links supports two build orchestrators: **Railpack** (default, modern, BuildKit-backed) and **Nixpacks** (supported deprecated fallback).
 
-### Nixpacks Installation (Default Builder)
-
-```bash
-curl -sSL https://nixpacks.com/install.sh | sudo bash
-nixpacks --version
-```
-
-### Railpack Installation (Recommended Next-Gen Builder)
+### Railpack Installation (Default Builder)
 
 ```bash
 # Install Railpack binary
@@ -101,7 +94,16 @@ curl -sSL https://railpack.com/install.sh | sudo bash
 railpack --version
 ```
 
-When using `BUILDER=railpack`, ensure the BuildKit daemon is accessible. The included `docker-compose.prod.yml` and `docker-compose.dev.yml` deploy a rootless BuildKit daemon on `127.0.0.1:1234`.
+Railpack requires an accessible BuildKit daemon via `BUILDKIT_HOST` (e.g. `tcp://127.0.0.1:1234`). Both `docker-compose.dev.yml` and production infrastructure provide rootless BuildKit on `127.0.0.1:1234`.
+
+### Nixpacks Installation (Deprecated Fallback)
+
+```bash
+curl -sSL https://nixpacks.com/install.sh | sudo bash
+nixpacks --version
+```
+
+To use Nixpacks during the deprecation transition, explicitly set `BUILDER=nixpacks` in your environment. Structured deprecation warnings will be logged and emitted in deployment logs.
 
 ---
 

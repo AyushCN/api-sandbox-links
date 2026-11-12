@@ -124,7 +124,7 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 		return fmt.Errorf("deploy: sandbox %s was destroyed; refusing to deploy", sandbox.ID)
 	}
 
-	builderName := "nixpacks"
+	builderName := "railpack"
 	if d.orch != nil && d.orch.Builder() != nil {
 		builderName = d.orch.Builder().Name()
 	}
