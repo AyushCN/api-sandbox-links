@@ -265,3 +265,79 @@ func TestDeployLifecycleFailedBuildIsRecorded(t *testing.T) {
 		t.Errorf("failed build discarded source workdir: %v", err)
 	}
 }
+
+func TestDeployerRecoverStuckBuildsGuards(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Nil deployer
+	var nilDeployer *Deployer
+	n, err := nilDeployer.RecoverStuckBuilds(ctx)
+	if err != nil || n != 0 {
+		t.Errorf("expected (0, nil), got (%d, %v)", n, err)
+	}
+
+	// 2. Deployer with nil store
+	d := &Deployer{}
+	n, err = d.RecoverStuckBuilds(ctx)
+	if err != nil || n != 0 {
+		t.Errorf("expected (0, nil), got (%d, %v)", n, err)
+	}
+	n, err = d.SweepTimedOutBuilds(ctx)
+	if err != nil || n != 0 {
+		t.Errorf("expected (0, nil), got (%d, %v)", n, err)
+	}
+}
+
+func TestDeployerRecoverStuckBuildsIntegration(t *testing.T) {
+	store, gdb := lifecycleEnv(t)
+	sb := lifecycleSandbox(t, store, gdb, "stuck-build", 880006)
+	d, _ := lifecycleDeployer(t, store, lifecycleNixpacks(t, "exit 0"))
+
+	// Create an in-flight deployment
+	dep, err := store.CreateDeployment(&db.Deployment{
+		SandboxID: sb.ID,
+		Trigger:   string(db.TriggerInitial),
+		Status:    string(db.DeployBuilding),
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+
+	recovered, err := d.RecoverStuckBuilds(context.Background())
+	if err != nil {
+		t.Fatalf("RecoverStuckBuilds: %v", err)
+	}
+	if recovered < 1 {
+		t.Fatalf("expected at least 1 recovered deployment, got %d", recovered)
+	}
+
+	// Verify deployment was marked failed
+	deps, err := store.ListDeployments(sb.ID)
+	if err != nil || len(deps) == 0 {
+		t.Fatalf("failed to list deployments: %v", err)
+	}
+	found := false
+	for _, it := range deps {
+		if it.ID == dep.ID {
+			found = true
+			if it.Status != string(db.DeployFailed) {
+				t.Errorf("expected deployment status failed, got %s", it.Status)
+			}
+			if !strings.Contains(it.LogExcerpt, "worker process restarted") {
+				t.Errorf("expected restart message in log, got %s", it.LogExcerpt)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("created deployment not found")
+	}
+
+	// Verify sandbox was marked failed
+	fresh, err := store.GetSandbox(sb.ID)
+	if err != nil {
+		t.Fatalf("GetSandbox: %v", err)
+	}
+	if fresh.Status != db.StatusFailed {
+		t.Errorf("expected sandbox status failed, got %s", fresh.Status)
+	}
+}

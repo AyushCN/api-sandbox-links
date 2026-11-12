@@ -70,6 +70,24 @@ func (d *Deployer) acquireBuildSlot(ctx context.Context) (func(), error) {
 	}
 }
 
+// RecoverStuckBuilds sweeps any deployments left in pending or building state
+// from a previous process run, and marks them failed with an explanatory message.
+func (d *Deployer) RecoverStuckBuilds(ctx context.Context) (int64, error) {
+	if d == nil || d.store == nil {
+		return 0, nil
+	}
+	return d.store.RecoverStuckDeployments(0, "build aborted: worker process restarted while build was in progress")
+}
+
+// SweepTimedOutBuilds marks any builds that have been running longer than DeployTimeout
+// as failed, preventing stuck processes or wedged tools from holding up queue slots forever.
+func (d *Deployer) SweepTimedOutBuilds(ctx context.Context) (int64, error) {
+	if d == nil || d.store == nil {
+		return 0, nil
+	}
+	return d.store.RecoverStuckDeployments(DeployTimeout, "build aborted: build exceeded maximum execution timeout of 20 minutes")
+}
+
 // sandboxDir returns the on-disk clone directory for a sandbox.
 func (d *Deployer) sandboxDir(subdomain string) string {
 	return filepath.Join(d.cfg.SandboxWorkDir, subdomain)

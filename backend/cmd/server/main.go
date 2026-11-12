@@ -74,6 +74,11 @@ func run() error {
 	defer orch.Close()
 
 	deployer := orchestrator.NewDeployer(cfg, store, orch, box, redis)
+	if recovered, err := deployer.RecoverStuckBuilds(ctx); err != nil {
+		logger.Warn("deployer: recovering stuck builds from previous run", slog.String("err", err.Error()))
+	} else if recovered > 0 {
+		logger.Info("deployer: recovered stuck builds from previous run", slog.Int64("count", recovered))
+	}
 
 	aiClient, err := ai.New(ctx, cfg.GeminiAPIKey, "gemini-2.5-flash", logger)
 	if err != nil {
@@ -94,6 +99,24 @@ func run() error {
 	go reaper.NewExpiryReaper(store, orch, cfg, logger, 60*time.Second).Run(ctx)
 	go reaper.NewSnapshotReaper(store, logger, reaper.SnapshotSweepInterval, reaper.SnapshotRetention).Run(ctx)
 	go orchestrator.NewStatsFlushWorker(store, redis, logger, orchestrator.StatsFlushInterval).Run(ctx)
+
+	// Sweep builds running longer than DeployTimeout (e.g. stalled build commands)
+	go func() {
+		ticker := time.NewTicker(2 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if timedOut, err := deployer.SweepTimedOutBuilds(ctx); err != nil {
+					logger.Warn("deployer: sweeping timed-out builds", slog.String("err", err.Error()))
+				} else if timedOut > 0 {
+					logger.Warn("deployer: cleaned up timed-out builds", slog.Int64("count", timedOut))
+				}
+			}
+		}
+	}()
 
 	// --- HTTP surfaces ---------------------------------------------------
 	server := api.New(cfg, store, redis, orch, deployer, box, aiClient, logger)

@@ -92,6 +92,7 @@ func (s *Server) handleLogsWS(w http.ResponseWriter, r *http.Request) {
 		ws.sendTerminal(wsEvent{Type: "unavailable", Reason: reason})
 		return
 	}
+	s.touchSandbox(ws.ctx, sb)
 
 	stream, err := s.orch.StreamContainerLogs(ws.ctx, sb.ContainerID)
 	if err != nil {
@@ -145,6 +146,7 @@ func (s *Server) handleLogsWS(w http.ResponseWriter, r *http.Request) {
 			ws.sendTerminal(wsEvent{Type: "closed", Reason: "log stream ended"})
 			return
 		case <-status.C:
+			s.touchSandbox(ws.ctx, sb)
 			if reason := s.stoppedReason(sb.ID); reason != "" {
 				ws.sendTerminal(wsEvent{Type: "closed", Reason: reason})
 				return
@@ -268,6 +270,7 @@ func (s *Server) handleStatsWS(w http.ResponseWriter, r *http.Request) {
 		ws.sendTerminal(wsEvent{Type: "unavailable", Reason: reason})
 		return
 	}
+	s.touchSandbox(ws.ctx, sb)
 
 	collector, err := s.orch.EnsureStatsCollector(sb.ID, sb.ContainerID)
 	if err != nil {
@@ -322,6 +325,7 @@ func (s *Server) handleStatsWS(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		case <-status.C:
+			s.touchSandbox(ws.ctx, sb)
 			if reason := s.stoppedReason(sb.ID); reason != "" {
 				ws.sendTerminal(wsEvent{Type: "closed", Reason: reason})
 				return
@@ -389,6 +393,20 @@ func (s *Server) stoppedReason(sandboxID string) string {
 		return "sandbox is no longer available"
 	}
 	return unavailableReason(sb)
+}
+
+// touchSandbox refreshes the Redis idle-timeout marker so an active interactive
+// session (logs stream, stats monitor, file editing) prevents the idle reaper
+// from hibernating the container while the user is actively working.
+func (s *Server) touchSandbox(ctx context.Context, sb *db.Sandbox) {
+	if s == nil || s.cache == nil || sb == nil || sb.ID == "" {
+		return
+	}
+	ttl := sb.IdleTimeoutSeconds
+	if ttl <= 0 {
+		ttl = 900 // default 15 minutes
+	}
+	_ = s.cache.Touch(ctx, sb.ID, ttl)
 }
 
 // --- connection plumbing --------------------------------------------------

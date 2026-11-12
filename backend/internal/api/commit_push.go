@@ -34,6 +34,7 @@ func (s *Server) handleCommitPush(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	s.touchSandbox(r.Context(), sb)
 	if sb.DestroyedAt != nil {
 		writeErr(w, http.StatusConflict, "sandbox is destroyed; nothing to commit")
 		return
