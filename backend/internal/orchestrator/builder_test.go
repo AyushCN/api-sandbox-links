@@ -75,6 +75,32 @@ func TestNewBuilderFactory(t *testing.T) {
 			t.Error("expected error for unsupported builder engine")
 		}
 	})
+
+	t.Run("D-01: nixpacks selection emits structured deprecation warning", func(t *testing.T) {
+		var logBuf bytes.Buffer
+		captureLogger := slog.New(slog.NewTextHandler(&logBuf, nil))
+		cfg := &config.Config{Builder: "nixpacks", NixpacksBin: "nixpacks"}
+		_, err := NewBuilder(cfg, captureLogger)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(logBuf.String(), "nixpacks is deprecated") {
+			t.Errorf("expected deprecation warning in log, got: %s", logBuf.String())
+		}
+	})
+
+	t.Run("D-02: railpack selection does not emit deprecation warning", func(t *testing.T) {
+		var logBuf bytes.Buffer
+		captureLogger := slog.New(slog.NewTextHandler(&logBuf, nil))
+		cfg := &config.Config{Builder: "railpack", RailpackBin: "railpack"}
+		_, err := NewBuilder(cfg, captureLogger)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if strings.Contains(logBuf.String(), "deprecated") {
+			t.Errorf("unexpected deprecation warning for railpack in log: %s", logBuf.String())
+		}
+	})
 }
 
 func TestProviderDefaultPort(t *testing.T) {

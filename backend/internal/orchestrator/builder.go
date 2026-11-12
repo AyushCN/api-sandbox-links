@@ -42,6 +42,9 @@ func NewBuilder(cfg *config.Config, logger *slog.Logger) (Builder, error) {
 
 	switch name {
 	case "nixpacks":
+		if logger != nil {
+			logger.Warn("builder: nixpacks is deprecated and will be removed in a future release; configure BUILDER=railpack")
+		}
 		return NewNixpacksBuilder(cfg.NixpacksBin, logger), nil
 	case "railpack":
 		return NewRailpackBuilder(cfg.RailpackBin, cfg.BuildKitHost, logger), nil

@@ -241,6 +241,12 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 	}
 
 	buildLog := &bytes.Buffer{}
+	if builderName == "nixpacks" {
+		d.orch.logger.Warn("deploy: nixpacks builder selected (deprecated)",
+			slog.String("sandbox", sandbox.ID),
+			slog.String("recommendation", "configure BUILDER=railpack"))
+		buildLog.WriteString("================================================================================\nDEPRECATION WARNING: Nixpacks is deprecated and will be removed in a future release.\nConfigure BUILDER=railpack to use the recommended builder.\n================================================================================\n\n")
+	}
 	plan, err := d.orch.PlanAnalyze(ctx, workDir)
 	if err != nil {
 		return markFailed(err)
