@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/api-sandbox-links/backend/internal/config"
+	"github.com/api-sandbox-links/backend/internal/runtime"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/network"
@@ -248,6 +249,44 @@ func (o *Orchestrator) RunSandbox(ctx context.Context, opts RunOptions) (*RunRes
 		labels[k] = v
 	}
 
+	if o.runner != nil {
+		spec := runtime.ContainerSpec{
+			Name:            "sandbox_" + opts.SandboxID[:8] + "_" + opts.Subdomain,
+			Image:           opts.ImageTag,
+			Env:             opts.Env,
+			Labels:          labels,
+			NetworkName:     netName(opts.SandboxID),
+			Init:            o.cfg.SandboxInit,
+			ReadonlyRootfs:  o.cfg.SandboxHardened,
+			Runtime:         o.cfg.SandboxRuntime,
+			CPUs:            defaultCPUQuota,
+			MemoryBytes:     defaultMemoryLimit,
+			MemorySwapBytes: defaultMemoryLimit,
+			PidsLimit:       defaultPIDs,
+			CapDrop:         []string{"ALL"},
+			CapAdd:          []string{"NET_BIND_SERVICE"},
+			NoNewPrivileges: true,
+		}
+		if o.cfg.SandboxHardened {
+			spec.Tmpfs = map[string]string{
+				"/tmp": "rw,noexec,nosuid,size=64m",
+				"/run": "rw,noexec,nosuid,size=16m",
+			}
+		}
+		info, err := o.runner.Create(ctx, spec)
+		if err != nil {
+			return nil, fmt.Errorf("orchestrator: creating sandbox container: %w", err)
+		}
+		if err := o.runner.Start(ctx, info.ID); err != nil {
+			return nil, fmt.Errorf("orchestrator: starting sandbox container: %w", err)
+		}
+		ip, err := o.ContainerIP(ctx, info.ID, netName(opts.SandboxID))
+		if err != nil {
+			return nil, err
+		}
+		return &RunResult{ContainerID: info.ID, IPAddress: ip, Port: opts.InternalPort}, nil
+	}
+
 	cc := &container.Config{
 		Image:  opts.ImageTag,
 		Env:    opts.Env,
@@ -280,6 +319,15 @@ func (o *Orchestrator) RunSandbox(ctx context.Context, opts RunOptions) (*RunRes
 
 // ContainerIP resolves a container's address on the given network.
 func (o *Orchestrator) ContainerIP(ctx context.Context, containerID, networkName string) (string, error) {
+	if o.runner != nil {
+		info, err := o.runner.Inspect(ctx, containerID)
+		if err != nil {
+			return "", err
+		}
+		if info.IPAddress != "" {
+			return info.IPAddress, nil
+		}
+	}
 	info, err := o.docker.ContainerInspect(ctx, containerID)
 	if err != nil {
 		return "", fmt.Errorf("orchestrator: inspecting container %s: %w", containerID, err)
@@ -293,6 +341,9 @@ func (o *Orchestrator) ContainerIP(ctx context.Context, containerID, networkName
 
 // StartContainer starts an existing (hibernated) container.
 func (o *Orchestrator) StartContainer(ctx context.Context, containerID string) error {
+	if o.runner != nil {
+		return o.runner.Start(ctx, containerID)
+	}
 	if err := o.docker.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
 		return fmt.Errorf("orchestrator: starting container %s: %w", containerID, err)
 	}
@@ -301,6 +352,9 @@ func (o *Orchestrator) StartContainer(ctx context.Context, containerID string) e
 
 // StopContainer stops a container without removing it (hibernate path).
 func (o *Orchestrator) StopContainer(ctx context.Context, containerID string) error {
+	if o.runner != nil {
+		return o.runner.Stop(ctx, containerID, 10)
+	}
 	timeout := 10
 	if err := o.docker.ContainerStop(ctx, containerID, container.StopOptions{Timeout: &timeout}); err != nil {
 		return fmt.Errorf("orchestrator: stopping container %s: %w", containerID, err)
@@ -310,6 +364,9 @@ func (o *Orchestrator) StopContainer(ctx context.Context, containerID string) er
 
 // RemoveContainer force-removes a container and its volumes (destroy path).
 func (o *Orchestrator) RemoveContainer(ctx context.Context, containerID string) error {
+	if o.runner != nil {
+		return o.runner.Remove(ctx, containerID)
+	}
 	if err := o.docker.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true, RemoveVolumes: false}); err != nil {
 		return fmt.Errorf("orchestrator: removing container %s: %w", containerID, err)
 	}

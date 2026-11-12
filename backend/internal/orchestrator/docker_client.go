@@ -13,6 +13,8 @@ import (
 	"github.com/api-sandbox-links/backend/internal/cache"
 	"github.com/api-sandbox-links/backend/internal/config"
 	"github.com/api-sandbox-links/backend/internal/db"
+	"github.com/api-sandbox-links/backend/internal/runtime"
+	"github.com/api-sandbox-links/backend/internal/runtime/docker"
 	"github.com/api-sandbox-links/backend/internal/secret"
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
@@ -29,6 +31,7 @@ import (
 type Orchestrator struct {
 	ctx        context.Context
 	docker     *client.Client
+	runner     runtime.ContainerRunner
 	cfg        *config.Config
 	store      *db.Store
 	cache      *cache.Redis
@@ -60,6 +63,7 @@ func New(ctx context.Context, cfg *config.Config, store *db.Store, cache *cache.
 	return &Orchestrator{
 		ctx:        ctx,
 		docker:     cli,
+		runner:     docker.NewDockerRunner(cli),
 		cfg:        cfg,
 		store:      store,
 		cache:      cache,
@@ -82,6 +86,16 @@ func (o *Orchestrator) Ping(ctx context.Context) error {
 	}
 	_, err := o.docker.Ping(ctx)
 	return err
+}
+
+// Runner returns the active container runner abstraction.
+func (o *Orchestrator) Runner() runtime.ContainerRunner {
+	return o.runner
+}
+
+// SetRunner overrides the container runner (useful for testing or alternative runtime backends).
+func (o *Orchestrator) SetRunner(r runtime.ContainerRunner) {
+	o.runner = r
 }
 
 // ImageSizeBytes inspects the given image tag and returns its virtual size in bytes.

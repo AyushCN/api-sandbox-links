@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/api-sandbox-links/backend/internal/db"
-	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/volume"
@@ -36,7 +35,7 @@ func (o *Orchestrator) SweepSandboxContainers(ctx context.Context, sandboxID str
 	}
 	for _, c := range containers {
 		o.StopStatsCollector(sandboxID)
-		if err := o.docker.ContainerStop(ctx, c.ID, container.StopOptions{}); err != nil {
+		if err := o.StopContainer(ctx, c.ID); err != nil {
 			o.logger.Warn("sweep: stopping container",
 				slog.String("container", c.ID), slog.String("err", err.Error()))
 		}
@@ -63,7 +62,7 @@ func (o *Orchestrator) TeardownSandbox(ctx context.Context, sandbox *db.Sandbox)
 	}
 	for _, c := range containers {
 		o.StopStatsCollector(sandbox.ID)
-		if err := o.docker.ContainerStop(ctx, c.ID, container.StopOptions{}); err != nil {
+		if err := o.StopContainer(ctx, c.ID); err != nil {
 			o.logger.Warn("teardown: stopping container",
 				slog.String("container", c.ID), slog.String("err", err.Error()))
 		}
