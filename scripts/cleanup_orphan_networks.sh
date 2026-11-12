@@ -27,3 +27,4 @@ for net in ${networks}; do
 done
 
 echo "==> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Reclaimed ${reclaimed} orphan networks."
+

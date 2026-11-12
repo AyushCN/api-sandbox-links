@@ -127,3 +127,4 @@ func main() {
 
 	log.Println("SUCCESS: All stored secrets re-encrypted with NEW_ENCRYPTION_KEY.")
 }
+

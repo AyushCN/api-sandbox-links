@@ -39,3 +39,4 @@ echo "--> Pruning backups older than ${RETENTION_DAYS} days..."
 find "${BACKUP_DIR}" -name "db_backup_*.sql.gz" -type f -mtime +"${RETENTION_DAYS}" -delete || true
 
 echo "==> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Database backup completed successfully."
+

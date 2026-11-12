@@ -39,3 +39,4 @@ echo "Remember to update your .env file with:"
 echo "ENCRYPTION_KEY=${NEW_ENCRYPTION_KEY}"
 echo "Then restart the backend service: sudo systemctl restart api-sandbox-backend"
 echo "=================================================================="
+

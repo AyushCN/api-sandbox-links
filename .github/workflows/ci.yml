@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main", "master", "production" ]
+  pull_request:
+    branches: [ "main", "master", "production" ]
+
+jobs:
+  lint-and-unit-tests:
+    name: Backend Unit Tests & Vetting
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          check-latest: true
+          cache-dependency-path: backend/go.sum
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run unit test suite
+        run: go test -v -count=1 ./...
+
+      - name: Verify server and CLI binaries build cleanly
+        run: |
+          go build -v -o /dev/null ./cmd/server
+          go build -v -o /dev/null ./cmd/rekey
+
+  e2e-smoke-test:
+    name: End-to-End Smoke Test (Docker & Gateway)
+    needs: lint-and-unit-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          check-latest: true
+          cache-dependency-path: backend/go.sum
+
+      - name: Install Nixpacks CLI
+        run: |
+          curl -sSL https://nixpacks.com/install.sh | sudo bash
+          nixpacks --version
+
+      - name: Install Railpack CLI (Latest)
+        run: |
+          LATEST_TAG=$(curl -s https://api.github.com/repos/railwayapp/railpack/releases/latest | jq -r .tag_name)
+          if [ -n "$LATEST_TAG" ] && [ "$LATEST_TAG" != "null" ]; then
+            echo "Installing Railpack ${LATEST_TAG}..."
+            curl -fsSL "https://github.com/railwayapp/railpack/releases/download/${LATEST_TAG}/railpack-${LATEST_TAG}-x86_64-unknown-linux-musl.tar.gz" | sudo tar -xz -C /usr/local/bin railpack
+            railpack --version
+          else
+            echo "Could not resolve latest Railpack tag; skipping Railpack CLI install"
+          fi
+
+      - name: Start Infrastructure Containers
+        run: |
+          docker compose -f docker-compose.dev.yml up -d postgres redis buildkit
+          echo "Waiting for services to become healthy..."
+          sleep 6
+          docker compose -f docker-compose.dev.yml ps
+
+      - name: Run Nixpacks End-to-End Smoke Test
+        working-directory: backend
+        run: |
+          ASL_SMOKE_BUILDER=nixpacks go test -v -tags=smoke -run TestSmokeDeployNodeJSSample ./test/e2e/ -timeout 15m
+
+      - name: Run Railpack End-to-End Smoke Test (if CLI available)
+        working-directory: backend
+        run: |
+          if command -v railpack >/dev/null 2>&1; then
+            export BUILDKIT_HOST="tcp://127.0.0.1:1234"
+            ASL_SMOKE_BUILDER=railpack go test -v -tags=smoke -run TestSmokeDeployNodeJSSample ./test/e2e/ -timeout 15m
+          else
+            echo "Railpack CLI not installed; skipping Railpack smoke test"
+          fi
+
+      - name: Run Maintenance Scripts Validation
+        run: |
+          ./scripts/cleanup_orphan_networks.sh
+          ./scripts/prune_disk.sh
+
+      - name: Teardown Infrastructure
+        if: always()
+        run: |
+          docker compose -f docker-compose.dev.yml down -v

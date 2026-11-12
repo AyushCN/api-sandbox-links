@@ -20,3 +20,4 @@ func TestTouchSandboxGuards(t *testing.T) {
 	srv.touchSandbox(ctx, &db.Sandbox{ID: ""})
 	srv.touchSandbox(ctx, &db.Sandbox{ID: "sb-123", IdleTimeoutSeconds: 600})
 }
+
