@@ -33,7 +33,7 @@ import (
 // Smoke test configuration defaults.
 const (
 	defaultSampleRepo   = "https://github.com/heroku/node-js-sample.git"
-	defaultSampleBranch = "main"
+	defaultSampleBranch = "master" // heroku/node-js-sample uses master branch
 	defaultDevPostgres  = "postgres://user:pass@127.0.0.1:5434/sandbox_platform?sslmode=disable"
 	defaultDevRedis     = "redis://127.0.0.1:6380"
 )
@@ -270,7 +270,11 @@ func TestSmokeDeployNodeJSSample(t *testing.T) {
 		t.Fatalf("failed to reload sandbox: %v", err)
 	}
 	if fresh.Status != db.StatusRunning {
-		t.Fatalf("expected sandbox status running, got %q", fresh.Status)
+		excerpt := ""
+		if deps, listErr := env.store.ListDeployments(sandbox.ID); listErr == nil && len(deps) > 0 {
+			excerpt = deps[0].LogExcerpt
+		}
+		t.Fatalf("expected sandbox status running, got %q (deployment log excerpt: %s)", fresh.Status, excerpt)
 	}
 	if fresh.ContainerID == "" {
 		t.Fatal("expected non-empty ContainerID on running sandbox")
