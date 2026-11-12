@@ -69,9 +69,34 @@ jobs:
             echo "Could not resolve latest Railpack tag; skipping Railpack CLI install"
           fi
 
+      - name: Configure Host for Rootless User Namespaces
+        run: |
+          # Ubuntu 24.04 (Noble Numbat) on GitHub-hosted runners restricts unprivileged
+          # user namespaces by default via AppArmor (kernel.apparmor_restrict_unprivileged_userns = 1).
+          # RootlessKit requires unprivileged user namespaces to start BuildKit without root privileges.
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            echo "Current apparmor_restrict_unprivileged_userns: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)"
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            echo "Updated apparmor_restrict_unprivileged_userns: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)"
+          fi
+          if [ -f /proc/sys/kernel/unprivileged_userns_clone ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+
       - name: Start Infrastructure Containers
         run: |
-          docker compose -f docker-compose.dev.yml up -d --wait postgres redis buildkit
+          dump_diagnostics() {
+            echo "::error::Infrastructure startup failed. Inspecting container states and logs..."
+            docker compose -f docker-compose.dev.yml ps -a || true
+            docker compose -f docker-compose.dev.yml logs --no-color buildkit || true
+            docker inspect sandbox-platform-buildkit || true
+          }
+          trap dump_diagnostics ERR
+
+          if ! docker compose -f docker-compose.dev.yml up -d --wait postgres redis buildkit; then
+            dump_diagnostics
+            exit 1
+          fi
           docker compose -f docker-compose.dev.yml ps
 
       - name: Run Nixpacks End-to-End Smoke Test
