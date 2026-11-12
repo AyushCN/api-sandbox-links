@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
@@ -14,6 +15,13 @@ import (
 	"github.com/api-sandbox-links/backend/internal/db"
 	"github.com/api-sandbox-links/backend/internal/orchestrator"
 )
+
+// maxFileBytes caps a single editor read or write. A sandbox repository is
+// user-controlled input; without a cap a multi-gigabyte file can exhaust the
+// backend's memory and disk.
+const maxFileBytes = 1 << 20
+
+var errFileTooLarge = errors.New("file exceeds the 1 MB limit")
 
 // fileEntry is the shape of one node in the file tree.
 type fileEntry struct {
@@ -44,7 +52,11 @@ func (s *Server) handleFileTree(w http.ResponseWriter, r *http.Request) {
 		if err != nil || rel == "." {
 			return nil
 		}
-		// The git internals are never editable through the UI; shows less noise.
+		// Symlinks and git internals are never editable through the UI; showing
+		// a symlink would invite a read/write through it.
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
 		if strings.HasPrefix(rel, ".git") {
 			return nil
 		}
@@ -76,17 +88,15 @@ func (s *Server) handleFileContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rel := r.URL.Query().Get("path")
-	full, err := safeJoin(root, rel)
+	data, info, err := readSandboxFile(root, rel)
 	if err != nil {
+		if errors.Is(err, errFileTooLarge) {
+			writeErr(w, http.StatusRequestEntityTooLarge, err.Error())
+			return
+		}
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	data, err := os.ReadFile(full)
-	if err != nil {
-		writeErr(w, http.StatusNotFound, "file not found")
-		return
-	}
-	info, _ := os.Stat(full)
 	isBinary := isBinary(data)
 	resp := map[string]any{
 		"path":   rel,
@@ -130,6 +140,7 @@ func (s *Server) handleSaveFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req saveFileRequest
+	r.Body = http.MaxBytesReader(w, r.Body, 2*maxFileBytes)
 	if err := decodeJSON(r, &req); err != nil || req.Path == "" {
 		writeErr(w, http.StatusBadRequest, "path is required")
 		return
@@ -140,17 +151,8 @@ func (s *Server) handleSaveFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "working directory not found (sandbox may still be building)")
 		return
 	}
-	full, err := safeJoin(root, req.Path)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
 	if strings.HasPrefix(filepath.Clean(req.Path), ".git") {
 		writeErr(w, http.StatusBadRequest, "git internals are not editable")
-		return
-	}
-	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not create directories")
 		return
 	}
 
@@ -164,8 +166,12 @@ func (s *Server) handleSaveFile(w http.ResponseWriter, r *http.Request) {
 	} else {
 		data = []byte(req.Content)
 	}
-	if err := os.WriteFile(full, data, 0o644); err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not write file")
+	if err := writeSandboxFile(root, req.Path, data); err != nil {
+		if errors.Is(err, errFileTooLarge) {
+			writeErr(w, http.StatusRequestEntityTooLarge, err.Error())
+			return
+		}
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	_ = s.store.RecordFileEdit(sb.ID, req.Path, user.ID)
@@ -201,20 +207,116 @@ func (s *Server) sandboxRoot(sandboxID string) (string, error) {
 }
 
 // safeJoin combines root with a user-supplied relative path, refusing any path
-// that would escape root via ".." or absolute segments.
+// that would escape root via ".." or absolute segments, any symbolic link, and
+// any resolved target outside root.
 func safeJoin(root, rel string) (string, error) {
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", httpErr("working directory not found")
+	}
 	rel = filepath.FromSlash(rel)
 	clean := filepath.Clean(rel)
 	if clean == "." || filepath.IsAbs(clean) || strings.HasPrefix(clean, "..") {
 		return "", httpErr("path must be relative and inside the working directory")
 	}
-	full := filepath.Join(root, clean)
-	// Double-check the resolved path stays under root.
-	relRoot, err := filepath.Rel(root, full)
+	full := filepath.Join(resolvedRoot, clean)
+	// Double-check the lexical path stays under root.
+	relRoot, err := filepath.Rel(resolvedRoot, full)
 	if err != nil || relRoot == ".." || strings.HasPrefix(relRoot, ".."+string(filepath.Separator)) {
 		return "", httpErr("path escapes the working directory")
 	}
+	if err := rejectSymlinkComponents(resolvedRoot, full); err != nil {
+		return "", err
+	}
+	// If the target already exists, resolve it as a final check. This catches a
+	// symlinked final component (and any link introduced between the component
+	// walk and this call).
+	if resolved, err := filepath.EvalSymlinks(full); err == nil {
+		if !pathWithin(resolvedRoot, resolved) {
+			return "", httpErr("path escapes the working directory")
+		}
+		return resolved, nil
+	} else if !os.IsNotExist(err) {
+		return "", httpErr("could not resolve path")
+	}
 	return full, nil
+}
+
+// rejectSymlinkComponents walks the existing prefix of target and rejects any
+// symlink. A missing suffix is allowed because save-file may create it.
+func rejectSymlinkComponents(root, target string) error {
+	rel, err := filepath.Rel(root, target)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return httpErr("path escapes the working directory")
+	}
+	cur := root
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		if part == "" || part == "." {
+			continue
+		}
+		cur = filepath.Join(cur, part)
+		info, err := os.Lstat(cur)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return httpErr("could not inspect path")
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return httpErr("symbolic links are not allowed")
+		}
+	}
+	return nil
+}
+
+func pathWithin(root, target string) bool {
+	rel, err := filepath.Rel(root, target)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// readSandboxFile safely reads one file under root, enforcing the size cap.
+func readSandboxFile(root, rel string) ([]byte, os.FileInfo, error) {
+	full, err := safeJoin(root, rel)
+	if err != nil {
+		return nil, nil, err
+	}
+	info, err := os.Stat(full)
+	if err != nil {
+		return nil, nil, httpErr("file not found")
+	}
+	if info.IsDir() {
+		return nil, nil, httpErr("path is a directory")
+	}
+	if info.Size() > maxFileBytes {
+		return nil, nil, errFileTooLarge
+	}
+	data, err := os.ReadFile(full)
+	if err != nil {
+		return nil, nil, httpErr("file not found")
+	}
+	if len(data) > maxFileBytes {
+		return nil, nil, errFileTooLarge
+	}
+	return data, info, nil
+}
+
+// writeSandboxFile safely writes one file under root, enforcing the size cap
+// before touching the filesystem.
+func writeSandboxFile(root, rel string, data []byte) error {
+	if len(data) > maxFileBytes {
+		return errFileTooLarge
+	}
+	full, err := safeJoin(root, rel)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		return httpErr("could not create directories")
+	}
+	if err := os.WriteFile(full, data, 0o644); err != nil {
+		return httpErr("could not write file")
+	}
+	return nil
 }
 
 // httpErr is a tiny error type whose message is safe to show to users.
