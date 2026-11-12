@@ -71,9 +71,7 @@ jobs:
 
       - name: Start Infrastructure Containers
         run: |
-          docker compose -f docker-compose.dev.yml up -d postgres redis buildkit
-          echo "Waiting for services to become healthy..."
-          sleep 6
+          docker compose -f docker-compose.dev.yml up -d --wait postgres redis buildkit
           docker compose -f docker-compose.dev.yml ps
 
       - name: Run Nixpacks End-to-End Smoke Test
@@ -81,11 +79,52 @@ jobs:
         run: |
           ASL_SMOKE_BUILDER=nixpacks go test -v -tags=smoke -run TestSmokeDeployNodeJSSample ./test/e2e/ -timeout 15m
 
+      - name: Verify BuildKit Readiness & gRPC Diagnostics
+        run: |
+          echo "=== 1. Inspect Docker Compose Services ==="
+          docker compose -f docker-compose.dev.yml ps
+
+          echo "=== 2. Port Mapping Verification ==="
+          docker compose -f docker-compose.dev.yml port buildkit 1234
+
+          echo "=== 3. BuildKit Startup Logs ==="
+          docker compose -f docker-compose.dev.yml logs --tail 30 buildkit
+
+          echo "=== 4. Extract buildctl for Host-Side Probing ==="
+          sudo docker cp sandbox-platform-buildkit:/usr/bin/buildctl /usr/local/bin/buildctl
+          sudo chmod +x /usr/local/bin/buildctl
+          buildctl --version
+
+          echo "=== 5. Bounded BuildKit gRPC Readiness Loop ==="
+          TARGET_ADDR="tcp://127.0.0.1:1234"
+          MAX_RETRIES=30
+          READY=0
+          for i in $(seq 1 $MAX_RETRIES); do
+            if buildctl --addr "$TARGET_ADDR" debug workers >/tmp/buildkit-workers.log 2>&1; then
+              echo "BuildKit gRPC API responded successfully on attempt $i:"
+              cat /tmp/buildkit-workers.log
+              READY=1
+              break
+            fi
+            echo "Waiting for BuildKit gRPC API at $TARGET_ADDR (attempt $i/$MAX_RETRIES)..."
+            sleep 1
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "::error::BuildKit gRPC API did not become ready at $TARGET_ADDR within ${MAX_RETRIES}s"
+            echo "=== BuildKit container logs ==="
+            docker compose -f docker-compose.dev.yml logs buildkit
+            echo "=== Container inspection ==="
+            docker inspect sandbox-platform-buildkit
+            exit 1
+          fi
+
       - name: Run Railpack End-to-End Smoke Test (if CLI available)
         working-directory: backend
         run: |
           if command -v railpack >/dev/null 2>&1; then
             export BUILDKIT_HOST="tcp://127.0.0.1:1234"
+            echo "Running Railpack E2E smoke test against BUILDKIT_HOST=${BUILDKIT_HOST}..."
             ASL_SMOKE_BUILDER=railpack go test -v -tags=smoke -run TestSmokeDeployNodeJSSample ./test/e2e/ -timeout 15m
           else
             echo "Railpack CLI not installed; skipping Railpack smoke test"

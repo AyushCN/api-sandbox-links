@@ -96,6 +96,41 @@ func setupSmokeEnv(t *testing.T) *smokeEnv {
 		t.Skipf("skipping e2e smoke test: builder binary %q not found on PATH. Install %s or set %s_BIN.", builderBin, builderName, strings.ToUpper(builderName))
 	}
 
+	// 2b. BuildKit connectivity check (for Railpack builder)
+	if builderName == "railpack" {
+		bkHost := os.Getenv("BUILDKIT_HOST")
+		if bkHost == "" {
+			bkHost = "tcp://127.0.0.1:1234"
+		}
+		ready := false
+		var probeErr error
+		for attempt := 1; attempt <= 10; attempt++ {
+			if buildctlBin, err := exec.LookPath("buildctl"); err == nil {
+				chkCtx, chkCancel := context.WithTimeout(context.Background(), 3*time.Second)
+				out, chkErr := exec.CommandContext(chkCtx, buildctlBin, "--addr", bkHost, "debug", "workers").CombinedOutput()
+				chkCancel()
+				if chkErr == nil {
+					ready = true
+					break
+				}
+				probeErr = fmt.Errorf("%v (output: %s)", chkErr, strings.TrimSpace(string(out)))
+			} else {
+				addr := strings.TrimPrefix(bkHost, "tcp://")
+				if conn, err := net.DialTimeout("tcp", addr, 1*time.Second); err == nil {
+					_ = conn.Close()
+					ready = true
+					break
+				} else {
+					probeErr = err
+				}
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		if !ready {
+			t.Skipf("skipping e2e smoke test: BuildKit daemon unreachable at %s (%v). Start docker-compose.dev.yml.", bkHost, probeErr)
+		}
+	}
+
 	// 3. PostgreSQL database check
 	dsn := os.Getenv("ASL_TEST_DATABASE_URL")
 	if dsn == "" {
