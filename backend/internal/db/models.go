@@ -153,13 +153,17 @@ type SandboxDatabase struct {
 
 // Deployment is one entry in a sandbox's deploy/build history.
 type Deployment struct {
-	ID         string     `gorm:"type:uuid;primaryKey" json:"id"`
-	SandboxID  string     `gorm:"type:uuid;not null" json:"sandbox_id"`
-	Trigger    string     `gorm:"not null" json:"trigger"`
-	Status     string     `gorm:"not null" json:"status"`
-	LogExcerpt string     `gorm:"type:text" json:"log_excerpt"`
-	StartedAt  time.Time  `gorm:"not null;default:now()" json:"started_at"`
-	FinishedAt *time.Time `json:"finished_at"`
+	ID              string     `gorm:"type:uuid;primaryKey" json:"id"`
+	SandboxID       string     `gorm:"type:uuid;not null" json:"sandbox_id"`
+	Trigger         string     `gorm:"not null" json:"trigger"`
+	Status          string     `gorm:"not null" json:"status"`
+	LogExcerpt      string     `gorm:"type:text" json:"log_excerpt"`
+	Builder         string     `gorm:"type:text" json:"builder,omitempty"`
+	BuildDurationMs *int64     `json:"build_duration_ms,omitempty"`
+	CacheHit        *bool      `json:"cache_hit,omitempty"`
+	ImageSizeBytes  *int64     `json:"image_size_bytes,omitempty"`
+	StartedAt       time.Time  `gorm:"not null;default:now()" json:"started_at"`
+	FinishedAt      *time.Time `json:"finished_at"`
 }
 
 // ResourceSnapshot is a persisted CPU/memory/network sample.

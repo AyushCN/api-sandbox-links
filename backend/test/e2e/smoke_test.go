@@ -293,6 +293,25 @@ func TestSmokeDeployNodeJSSample(t *testing.T) {
 		}
 	}
 
+	// Verify structured deployment telemetry (T-01, T-03, T-05)
+	deps, err := env.store.ListDeployments(sandbox.ID)
+	if err != nil || len(deps) == 0 {
+		t.Fatalf("failed to query deployments: %v", err)
+	}
+	dep := deps[0]
+	if dep.Builder != env.cfg.Builder {
+		t.Errorf("expected deployment.builder = %q, got %q", env.cfg.Builder, dep.Builder)
+	}
+	if dep.BuildDurationMs == nil || *dep.BuildDurationMs <= 0 {
+		t.Errorf("expected positive BuildDurationMs in deployment, got %v", dep.BuildDurationMs)
+	}
+	if dep.ImageSizeBytes == nil || *dep.ImageSizeBytes <= 0 {
+		t.Errorf("expected positive ImageSizeBytes in deployment, got %v", dep.ImageSizeBytes)
+	} else {
+		t.Logf("telemetry verified: builder=%s, duration=%dms, image_size=%d bytes",
+			dep.Builder, *dep.BuildDurationMs, *dep.ImageSizeBytes)
+	}
+
 	// Step 3: Validate HTTP response through Gateway Reverse Proxy
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/", nil)

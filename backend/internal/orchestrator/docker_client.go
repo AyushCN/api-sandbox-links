@@ -84,6 +84,19 @@ func (o *Orchestrator) Ping(ctx context.Context) error {
 	return err
 }
 
+// ImageSizeBytes inspects the given image tag and returns its virtual size in bytes.
+// If the image does not exist or inspection fails, an error is returned.
+func (o *Orchestrator) ImageSizeBytes(ctx context.Context, imageTag string) (int64, error) {
+	if o == nil || o.docker == nil {
+		return 0, fmt.Errorf("orchestrator: docker client not initialized")
+	}
+	inspect, _, err := o.docker.ImageInspectWithRaw(ctx, imageTag)
+	if err != nil {
+		return 0, fmt.Errorf("orchestrator: inspecting image %s: %w", imageTag, err)
+	}
+	return inspect.Size, nil
+}
+
 // Logger exposes the slog logger for use by helpers in this package.
 func (o *Orchestrator) Logger() *slog.Logger { return o.logger }
 

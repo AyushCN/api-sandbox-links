@@ -124,30 +124,46 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 		return fmt.Errorf("deploy: sandbox %s was destroyed; refusing to deploy", sandbox.ID)
 	}
 
+	builderName := "nixpacks"
+	if d.orch != nil && d.orch.Builder() != nil {
+		builderName = d.orch.Builder().Name()
+	}
+
 	deploy, err := d.store.CreateDeployment(&db.Deployment{
 		SandboxID: sandbox.ID,
 		Trigger:   string(opts.Trigger),
 		Status:    string(db.DeployPending),
+		Builder:   builderName,
 	})
 	if err != nil {
 		return fmt.Errorf("deploy: recording deployment: %w", err)
 	}
 
-	markFailed := func(cause error, logs ...string) error {
+	markFailed := func(cause error, logsAndDuration ...any) error {
 		now := deploymentFinished()
 		logExcerpt := cause.Error()
-		if len(logs) > 0 && logs[0] != "" {
-			// Include build output if available
-			combined := logs[0]
-			if combined != "" {
-				logExcerpt = truncate(combined+"\n"+cause.Error(), 4000)
+		var buildDuration *int64
+		if len(logsAndDuration) > 0 {
+			if logStr, ok := logsAndDuration[0].(string); ok && logStr != "" {
+				logExcerpt = truncate(logStr+"\n"+cause.Error(), 4000)
 			}
 		}
-		_ = d.store.UpdateDeployment(deploy.ID, map[string]any{
+		if len(logsAndDuration) > 1 {
+			if dur, ok := logsAndDuration[1].(int64); ok && dur > 0 {
+				buildDuration = &dur
+			}
+		}
+
+		patch := map[string]any{
 			"status":      string(db.DeployFailed),
 			"log_excerpt": logExcerpt,
 			"finished_at": now,
-		})
+			"builder":     builderName,
+		}
+		if buildDuration != nil {
+			patch["build_duration_ms"] = *buildDuration
+		}
+		_ = d.store.UpdateDeployment(deploy.ID, patch)
 		// A failed deploy must not leave any runtime behind. Tear down by the
 		// sandbox-id label (not the stored container ID, which may still be
 		// empty) so orphan app containers, sidecars, volumes, the network, and
@@ -185,7 +201,10 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 	}
 	defer release()
 
-	if err := d.store.UpdateDeployment(deploy.ID, map[string]any{"status": string(db.DeployBuilding)}); err != nil {
+	if err := d.store.UpdateDeployment(deploy.ID, map[string]any{
+		"status":  string(db.DeployBuilding),
+		"builder": builderName,
+	}); err != nil {
 		return markFailed(fmt.Errorf("deploy: marking deployment building: %w", err))
 	}
 	if err := d.store.UpdateSandbox(sandbox.ID, map[string]any{"status": string(db.StatusBuilding)}); err != nil {
@@ -228,10 +247,23 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 	}
 	port := plan.InternalPort
 
+	buildStart := time.Now()
 	imageTag, err := d.orch.BuildImage(ctx, workDir, "sandbox-"+sandbox.Subdomain, buildLog)
+	buildDurationMs := time.Since(buildStart).Milliseconds()
 	if err != nil {
-		return markFailed(err, buildLog.String())
+		return markFailed(err, buildLog.String(), buildDurationMs)
 	}
+
+	// Inspect image size on successful build
+	var imageSizeBytes *int64
+	if size, sizeErr := d.orch.ImageSizeBytes(ctx, imageTag); sizeErr == nil && size > 0 {
+		imageSizeBytes = &size
+	} else if sizeErr != nil {
+		d.orch.logger.Debug("deploy: inspecting image size", slog.String("image", imageTag), slog.String("err", sizeErr.Error()))
+	}
+
+	// Analyze builder logs for confirmed cache hit evidence
+	cacheHit := detectCacheHit(builderName, buildLog.String())
 
 	// Shut down and remove any previous container so the new image takes over.
 	// Sidecar DB containers are untouched — only the app container is replaced.
@@ -304,9 +336,11 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 				slog.String("sandbox", sandbox.ID), slog.String("err", rmErr.Error()))
 		}
 		return d.store.UpdateDeployment(deploy.ID, map[string]any{
-			"status":      string(db.DeployFailed),
-			"log_excerpt": "sandbox was destroyed while this deployment was still building",
-			"finished_at": now,
+			"status":            string(db.DeployFailed),
+			"log_excerpt":       "sandbox was destroyed while this deployment was still building",
+			"finished_at":       now,
+			"builder":           builderName,
+			"build_duration_ms": buildDurationMs,
 		})
 	case err != nil:
 		return markFailed(fmt.Errorf("deploy: persisting run state: %w", err))
@@ -320,18 +354,27 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 	defer cancel()
 	_ = d.cache.Touch(touchCtx, sandbox.ID, sandbox.IdleTimeoutSeconds)
 
-	if err := d.store.UpdateDeployment(deploy.ID, map[string]any{
-		"status":      string(db.DeploySuccess),
-		"log_excerpt": truncate(buildLog.String(), 4000),
-		"finished_at": now,
-	}); err != nil {
+	if plan.Builder != "" {
+		builderName = plan.Builder
+	}
+
+	deployPatch := map[string]any{
+		"status":            string(db.DeploySuccess),
+		"log_excerpt":       truncate(buildLog.String(), 4000),
+		"finished_at":       now,
+		"builder":           builderName,
+		"build_duration_ms": buildDurationMs,
+	}
+	if imageSizeBytes != nil {
+		deployPatch["image_size_bytes"] = *imageSizeBytes
+	}
+	if cacheHit != nil {
+		deployPatch["cache_hit"] = *cacheHit
+	}
+	if err := d.store.UpdateDeployment(deploy.ID, deployPatch); err != nil {
 		d.orch.logger.Warn("deploy: finalizing deployment record", slog.String("err", err.Error()))
 	}
 	// Capture build metadata on the sandbox row for the UI/debugging.
-	builderName := plan.Builder
-	if builderName == "" && d.orch != nil && d.orch.Builder() != nil {
-		builderName = d.orch.Builder().Name()
-	}
 	buildMeta, _ := json.Marshal(map[string]any{
 		"builder":  builderName,
 		"provider": plan.Provider,
@@ -486,4 +529,40 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return s[:max]
+}
+
+// detectCacheHit inspects raw build logs for affirmative cache evidence.
+// It returns a non-nil pointer only when actual evidence is present in the output;
+// ambiguous or empty logs return nil.
+func detectCacheHit(builder string, logs string) *bool {
+	if strings.TrimSpace(logs) == "" {
+		return nil
+	}
+	tVal := true
+	fVal := false
+
+	lower := strings.ToLower(logs)
+	switch strings.ToLower(builder) {
+	case "railpack":
+		// BuildKit emits "=> CACHED [" or "[cached]" on cache hit
+		if strings.Contains(logs, "CACHED") || strings.Contains(lower, "[cached]") {
+			return &tVal
+		}
+		// If BuildKit executed steps without any CACHED markers
+		if strings.Contains(logs, "=> [") || strings.Contains(logs, "DONE") {
+			return &fVal
+		}
+	case "nixpacks":
+		if strings.Contains(lower, "cache hit") || strings.Contains(lower, "using cache") || strings.Contains(lower, "cached") {
+			return &tVal
+		}
+		if strings.Contains(lower, "generating") || strings.Contains(lower, "building") {
+			return &fVal
+		}
+	default:
+		if strings.Contains(lower, "cache hit") || strings.Contains(logs, "CACHED") {
+			return &tVal
+		}
+	}
+	return nil
 }
