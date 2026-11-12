@@ -247,8 +247,9 @@ func TestDeployLifecycleFailedBuildIsRecorded(t *testing.T) {
 	sb := lifecycleSandbox(t, store, gdb, "build-fails", 880005)
 	d, root := lifecycleDeployer(t, store, lifecycleNixpacks(t, "echo intentional-failure >&2\nexit 7"))
 	workDir := lifecycleSeedWorkDir(t, root, sb, "package.json", `{"scripts":{"start":"node index.js"}}`)
-	if err := d.DeploySandbox(context.Background(), sb, DeployOptions{Trigger: db.TriggerInitial}); err != nil {
-		t.Fatalf("DeploySandbox: %v", err)
+	err := d.DeploySandbox(context.Background(), sb, DeployOptions{Trigger: db.TriggerInitial})
+	if err == nil {
+		t.Fatal("expected DeploySandbox to return build error, got nil")
 	}
 	fresh, err := store.GetSandbox(sb.ID)
 	if err != nil || fresh.Status != db.StatusFailed {

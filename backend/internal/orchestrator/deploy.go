@@ -167,9 +167,10 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 			d.orch.logger.Info("deploy: failed build on destroyed sandbox; removed work dir",
 				slog.String("sandbox", sandbox.ID))
 		}
-		return d.store.UpdateSandbox(sandbox.ID, map[string]any{
+		_ = d.store.UpdateSandbox(sandbox.ID, map[string]any{
 			"status": string(db.StatusFailed),
 		})
+		return cause
 	}
 
 	// Queue behind other builds before doing any expensive work. The row is
