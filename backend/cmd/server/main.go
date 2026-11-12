@@ -32,6 +32,15 @@ func main() {
 	}
 }
 
+// apiAddr binds the control-plane API to loopback only. Sandbox containers can
+// reach the host's bridge address, so an API on 0.0.0.0 would be directly
+// reachable from untrusted sandbox code; Traefik only needs the gateway.
+func apiAddr(port int) string { return fmt.Sprintf("127.0.0.1:%d", port) }
+
+// gatewayAddr is intentionally not loopback: Traefik runs in its own container
+// and reaches the gateway through host.docker.internal.
+func gatewayAddr(port int) string { return fmt.Sprintf(":%d", port) }
+
 // run contains the full bootstrap. Splitting it from main keeps main readable
 // and makes the whole boot sequence testable.
 func run() error {
@@ -100,8 +109,8 @@ func run() error {
 	apiHandler := server.Router()
 	gatewayHandler := server.Gateway()
 
-	apiSrv := &http.Server{Addr: fmt.Sprintf(":%d", cfg.BackendPort), Handler: apiHandler}
-	gatewaySrv := &http.Server{Addr: fmt.Sprintf(":%d", cfg.GatewayPort), Handler: gatewayHandler}
+	apiSrv := &http.Server{Addr: apiAddr(cfg.BackendPort), Handler: apiHandler}
+	gatewaySrv := &http.Server{Addr: gatewayAddr(cfg.GatewayPort), Handler: gatewayHandler}
 
 	errCh := make(chan error, 2)
 	go func() { errCh <- apiSrv.ListenAndServe() }()
