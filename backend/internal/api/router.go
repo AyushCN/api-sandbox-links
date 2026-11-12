@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -17,6 +18,13 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 )
 
+// sandboxDeployer is the deploy entry point used by the HTTP handlers. Keeping
+// it as an interface makes the handlers testable without cloning or building a
+// real repository.
+type sandboxDeployer interface {
+	DeploySandbox(context.Context, *db.Sandbox, orchestrator.DeployOptions) error
+}
+
 // Server bundles every dependency the HTTP layer needs. It is constructed
 // once in main and shared by all handlers.
 type Server struct {
@@ -24,7 +32,7 @@ type Server struct {
 	store    *db.Store
 	cache    *cache.Redis
 	orch     *orchestrator.Orchestrator
-	deployer *orchestrator.Deployer
+	deployer sandboxDeployer
 	box      *secret.Box
 	ai       *ai.Client
 	logger   *slog.Logger
@@ -97,6 +105,7 @@ func (s *Server) Router() http.Handler {
 			pr.Get("/{id}", s.handleGetSandbox)
 			pr.Post("/{id}/actions/extend", s.handleExtendLifetime)
 			pr.Post("/{id}/actions/destroy", s.handleDestroySandbox)
+			pr.Post("/{id}/actions/recreate", s.handleRecreateSandbox)
 			pr.Post("/{id}/fork", s.handleForkSandbox)
 			pr.Get("/{id}/deployments", s.handleListDeployments)
 			pr.Post("/{id}/deploy", s.handleRedeploy)

@@ -2,13 +2,17 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/api-sandbox-links/backend/internal/db"
+	"github.com/api-sandbox-links/backend/internal/git"
 	"github.com/api-sandbox-links/backend/internal/orchestrator"
+	"github.com/google/uuid"
 )
 
 // extendLifetimeRequest is the body of POST /{id}/actions/extend.
@@ -119,6 +123,130 @@ func (s *Server) handleDestroySandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.sandboxJSON(destroyed))
+}
+
+// recreateSandboxRequest is the optional body of POST /{id}/actions/recreate.
+type recreateSandboxRequest struct {
+	LifetimeSeconds int64 `json:"lifetime_seconds"`
+}
+
+// handleRecreateSandbox creates a fresh sandbox from the repository, branch and
+// environment of a destroyed one. The tombstone is deliberately left in place:
+// history, deployments and the original subdomain stay intact, while the new
+// row gets its own ID, lifetime and fresh runtime. Sidecar data is not restored
+// (teardown removed it); database detection runs again from the repo.
+func (s *Server) handleRecreateSandbox(w http.ResponseWriter, r *http.Request) {
+	parent, ok := s.requireOwnedSandbox(w, r)
+	if !ok {
+		return
+	}
+	user, ok := s.userFrom(r)
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, "not signed in")
+		return
+	}
+	if parent.DestroyedAt == nil {
+		writeErr(w, http.StatusConflict, "only destroyed sandboxes can be recreated")
+		return
+	}
+
+	var req recreateSandboxRequest
+	if err := decodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	lifetime := req.LifetimeSeconds
+	if lifetime == 0 {
+		// The list view's recreate button sends no body: reuse the lifetime the
+		// user originally chose, clamped to the current allowed range.
+		lifetime = parent.LifetimeSeconds
+		if lifetime < MinLifetimeSeconds {
+			lifetime = MinLifetimeSeconds
+		}
+		if lifetime > s.maxLifetime() {
+			lifetime = s.maxLifetime()
+		}
+	} else if lifetime < MinLifetimeSeconds || lifetime > s.maxLifetime() {
+		writeErr(w, http.StatusBadRequest,
+			fmt.Sprintf("lifetime_seconds must be between %d and %d", MinLifetimeSeconds, s.maxLifetime()))
+		return
+	}
+
+	repo, err := s.store.GetRepository(parent.RepositoryID)
+	if err != nil {
+		s.logger.Warn("recreate: loading repository",
+			slog.String("sandbox", parent.ID), slog.String("err", err.Error()))
+		writeErr(w, http.StatusInternalServerError, "could not load repository")
+		return
+	}
+
+	name := parent.Subdomain
+	if info, err := git.ParseGitHubURL(repo.GithubURL); err == nil {
+		name = info.Name
+	}
+	subdomain, err := s.uniqueSubdomain(name)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not allocate subdomain")
+		return
+	}
+
+	idleTimeout := parent.IdleTimeoutSeconds
+	if idleTimeout < 60 {
+		idleTimeout = 900
+	}
+	now := time.Now()
+	child := &db.Sandbox{
+		ID:                 uuid.NewString(),
+		RepositoryID:       repo.ID,
+		BranchName:         parent.BranchName,
+		Subdomain:          subdomain,
+		Status:             db.StatusQueued,
+		IdleTimeoutSeconds: idleTimeout,
+		LifetimeSeconds:    lifetime,
+		ExpiresAt:          now.Add(time.Duration(lifetime) * time.Second),
+		CreatedAt:          now,
+	}
+	if err := s.store.CreateSandboxWithinLimits(child, user.ID, s.maxActiveSandboxes(), s.maxRunningSandboxes()); err != nil {
+		switch {
+		case errors.Is(err, db.ErrSandboxQuotaExceeded):
+			s.writeSandboxQuotaExceeded(w)
+		case errors.Is(err, db.ErrGlobalCapacityReached):
+			s.writeGlobalCapacityExceeded(w)
+		default:
+			s.logger.Warn("recreate: creating sandbox",
+				slog.String("parent", parent.ID), slog.String("err", err.Error()))
+			writeErr(w, http.StatusInternalServerError, "could not recreate sandbox")
+		}
+		return
+	}
+
+	// Copy the parent's env vars; the encrypted values can be copied directly
+	// without decrypting them here.
+	if vars, err := s.store.ListEnvVars(parent.ID); err != nil {
+		s.logger.Warn("recreate: loading env vars",
+			slog.String("parent", parent.ID), slog.String("err", err.Error()))
+	} else {
+		for _, v := range vars {
+			if err := s.store.UpsertEnvVar(child.ID, v.Key, v.Value, v.IsAISuggested); err != nil {
+				s.logger.Warn("recreate: copying env var",
+					slog.String("sandbox", child.ID), slog.String("key", v.Key), slog.String("err", err.Error()))
+			}
+		}
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), orchestrator.DeployTimeout)
+		defer cancel()
+		if err := s.deployer.DeploySandbox(ctx, child, orchestrator.DeployOptions{
+			Trigger:          db.TriggerRecreate,
+			DatabaseOverride: "auto",
+		}); err != nil {
+			s.logger.Warn("recreate deploy failed",
+				slog.String("sandbox", child.ID), slog.String("err", err.Error()))
+		}
+	}()
+
+	writeJSON(w, http.StatusAccepted, s.sandboxJSON(child))
 }
 
 // handleRedeploy triggers a manual rebuild (used after edits are saved and by

@@ -46,6 +46,7 @@ const (
 	TriggerGithubPush   DeploymentTrigger = "github_push"
 	TriggerManual       DeploymentTrigger = "manual"
 	TriggerFork         DeploymentTrigger = "fork"
+	TriggerRecreate     DeploymentTrigger = "recreate"
 )
 
 // DestructionReason explains why a sandbox was permanently destroyed.
