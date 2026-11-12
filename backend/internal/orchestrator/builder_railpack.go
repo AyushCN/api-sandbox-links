@@ -44,12 +44,17 @@ func (b *RailpackBuilder) Name() string {
 // Railpack serializes high-level metadata (providers, startCommand, env) across railpack plan
 // and railpack prepare outputs. Permissive unmarshaling tolerates schema variations.
 type railpackPlanPayload struct {
-	Providers []string `json:"providers"`
-	Provider  string   `json:"provider"`
-	Languages []string `json:"languages"`
-	Deploy    struct {
-		StartCommand string `json:"startCommand"`
-		StartCmd     string `json:"start_cmd"`
+	Providers         []string `json:"providers"`
+	Provider          string   `json:"provider"`
+	Languages         []string `json:"languages"`
+	DetectedProviders []string `json:"detectedProviders"`
+	Metadata          struct {
+		Providers string `json:"providers"`
+	} `json:"metadata"`
+	Deploy struct {
+		StartCommand string            `json:"startCommand"`
+		StartCmd     string            `json:"start_cmd"`
+		Variables    map[string]string `json:"variables"`
 	} `json:"deploy"`
 	Start struct {
 		Cmd string `json:"cmd"`
@@ -88,13 +93,13 @@ func railpackEnv(home, buildkitHost string) []string {
 }
 
 // PlanAnalyze inspects dir using Railpack and returns a normalized BuildPlan.
-// It first attempts `railpack plan <dir> --json`, falling back to `railpack prepare <dir> --info-out <file>`.
+// It first attempts `railpack plan <dir>`, falling back to `railpack prepare <dir> --info-out <file>`.
 func (b *RailpackBuilder) PlanAnalyze(ctx context.Context, dir string) (*BuildPlan, error) {
 	home := os.Getenv("HOME")
 	cmdEnv := railpackEnv(home, b.buildkitHost)
 
-	// Attempt 1: railpack plan <dir> --json
-	cmd := exec.CommandContext(ctx, b.bin, "plan", dir, "--json")
+	// Attempt 1: railpack plan <dir>
+	cmd := exec.CommandContext(ctx, b.bin, "plan", dir)
 	cmd.Env = cmdEnv
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -139,6 +144,12 @@ func parseRailpackPlan(data []byte) (*BuildPlan, error) {
 	if provider == "" && len(p.Languages) > 0 {
 		provider = p.Languages[0]
 	}
+	if provider == "" && len(p.DetectedProviders) > 0 {
+		provider = p.DetectedProviders[0]
+	}
+	if provider == "" && p.Metadata.Providers != "" {
+		provider = p.Metadata.Providers
+	}
 
 	startCmd := p.Deploy.StartCommand
 	if startCmd == "" {
@@ -149,6 +160,9 @@ func parseRailpackPlan(data []byte) (*BuildPlan, error) {
 	}
 
 	variables := p.Variables
+	if variables == nil && p.Deploy.Variables != nil {
+		variables = p.Deploy.Variables
+	}
 	if variables == nil && p.Env != nil {
 		variables = p.Env
 	}
@@ -171,12 +185,21 @@ func (b *RailpackBuilder) BuildImage(ctx context.Context, dir, name string, prog
 	cmd := exec.CommandContext(ctx, b.bin, args...)
 	cmd.Env = railpackEnv(os.Getenv("HOME"), b.buildkitHost)
 
+	var outputBuf bytes.Buffer
 	if progress != nil {
-		cmd.Stdout = progress
-		cmd.Stderr = progress
+		mw := io.MultiWriter(progress, &outputBuf)
+		cmd.Stdout = mw
+		cmd.Stderr = mw
+	} else {
+		cmd.Stdout = &outputBuf
+		cmd.Stderr = &outputBuf
 	}
 
 	if err := cmd.Run(); err != nil {
+		outStr := strings.TrimSpace(outputBuf.String())
+		if outStr != "" {
+			return "", fmt.Errorf("railpack builder: build failed: %w\nOutput:\n%s", err, outStr)
+		}
 		return "", fmt.Errorf("railpack builder: build failed: %w", err)
 	}
 

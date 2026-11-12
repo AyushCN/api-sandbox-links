@@ -83,8 +83,10 @@ services:
     security_opt:
       - seccomp=unconfined
       - apparmor=unconfined
-    environment:
-      - BUILDKITD_FLAGS=--oci-worker-no-process-sandbox
+    command:
+      - --addr
+      - tcp://0.0.0.0:1234
+      - --oci-worker-no-process-sandbox
     ports:
       - "127.0.0.1:1234:1234"
     volumes:

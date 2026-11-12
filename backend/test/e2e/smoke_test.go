@@ -261,7 +261,11 @@ func TestSmokeDeployNodeJSSample(t *testing.T) {
 		Trigger: db.TriggerInitial,
 	})
 	if err != nil {
-		t.Fatalf("DeploySandbox failed: %v", err)
+		excerpt := ""
+		if deps, listErr := env.store.ListDeployments(sandbox.ID); listErr == nil && len(deps) > 0 {
+			excerpt = deps[0].LogExcerpt
+		}
+		t.Fatalf("DeploySandbox failed: %v\nDeployment Log Excerpt:\n%s", err, excerpt)
 	}
 
 	// Step 2: Validate persisted state
