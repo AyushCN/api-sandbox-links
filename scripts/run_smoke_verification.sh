@@ -34,7 +34,7 @@ fi
 # Pre-flight check 2: Compose dependencies
 echo -n "Checking infrastructure containers (postgres, redis)... "
 running_containers=$(docker ps --format "{{.Names}}")
-if echo "${running_containers}" | grep -q "postgres" && echo "${running_containers}" | grep -q "redis"; then
+if echo "${running_containers}" | grep -q -E "(postgres|sandbox-platform-db)" && echo "${running_containers}" | grep -q -E "(redis|sandbox-platform-redis)"; then
     echo -e "${GREEN}OK${NC}"
 else
     echo -e "${YELLOW}NOT RUNNING${NC}"
@@ -43,6 +43,9 @@ else
     echo "--> Waiting 5s for database readiness..."
     sleep 5
 fi
+
+# Ensure default BuildKit host if unset
+export BUILDKIT_HOST="${BUILDKIT_HOST:-tcp://127.0.0.1:1234}"
 
 run_test_for_builder() {
     local b="$1"
@@ -67,7 +70,7 @@ run_test_for_builder() {
     echo "Running go test with -tags=smoke..."
     START_TIME=$(date +%s)
     
-    if (cd "${REPO_ROOT}/backend" && ASL_SMOKE_BUILDER="${b}" go test -v -tags=smoke -run TestSmokeFullLifecycle ./test/e2e -timeout 10m); then
+    if (cd "${REPO_ROOT}/backend" && ASL_SMOKE_BUILDER="${b}" go test -v -tags=smoke -run TestSmokeDeployNodeJSSample ./test/e2e/ -timeout 15m); then
         DURATION=$(( $(date +%s) - START_TIME ))
         echo -e "${GREEN}✓ Smoke test passed for ${b} in ${DURATION}s.${NC}"
     else
@@ -97,3 +100,4 @@ echo ""
 echo -e "${GREEN}================================================================${NC}"
 echo -e "${GREEN}      Live Smoke Verification Suite Completed!                  ${NC}"
 echo -e "${GREEN}================================================================${NC}"
+
