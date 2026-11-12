@@ -34,6 +34,7 @@ type Orchestrator struct {
 	cache      *cache.Redis
 	secret     *secret.Box
 	logger     *slog.Logger
+	builder    Builder
 	statsMu    sync.Mutex // guards collectors
 	collectors map[string]*StatsCollector
 }
@@ -52,6 +53,10 @@ func New(ctx context.Context, cfg *config.Config, store *db.Store, cache *cache.
 	if _, err := cli.Ping(ctx); err != nil {
 		return nil, fmt.Errorf("orchestrator: cannot reach docker daemon (%s): %w", cfg.DockerHost, err)
 	}
+	builder, err := NewBuilder(cfg, logger)
+	if err != nil {
+		return nil, fmt.Errorf("orchestrator: initializing builder: %w", err)
+	}
 	return &Orchestrator{
 		ctx:        ctx,
 		docker:     cli,
@@ -60,6 +65,7 @@ func New(ctx context.Context, cfg *config.Config, store *db.Store, cache *cache.
 		cache:      cache,
 		secret:     box,
 		logger:     logger,
+		builder:    builder,
 		collectors: map[string]*StatsCollector{},
 	}, nil
 }
@@ -67,6 +73,15 @@ func New(ctx context.Context, cfg *config.Config, store *db.Store, cache *cache.
 // Close releases the orchestrator's Docker client connection.
 func (o *Orchestrator) Close() error {
 	return o.docker.Close()
+}
+
+// Ping verifies connectivity to the Docker daemon.
+func (o *Orchestrator) Ping(ctx context.Context) error {
+	if o == nil || o.docker == nil {
+		return fmt.Errorf("orchestrator: docker client not initialized")
+	}
+	_, err := o.docker.Ping(ctx)
+	return err
 }
 
 // Logger exposes the slog logger for use by helpers in this package.

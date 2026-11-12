@@ -309,7 +309,12 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 		d.orch.logger.Warn("deploy: finalizing deployment record", slog.String("err", err.Error()))
 	}
 	// Capture build metadata on the sandbox row for the UI/debugging.
+	builderName := plan.Builder
+	if builderName == "" && d.orch != nil && d.orch.Builder() != nil {
+		builderName = d.orch.Builder().Name()
+	}
 	buildMeta, _ := json.Marshal(map[string]any{
+		"builder":  builderName,
 		"provider": plan.Provider,
 		"port":     plan.InternalPort,
 		"start":    plan.StartCmd,

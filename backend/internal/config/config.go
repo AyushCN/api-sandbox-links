@@ -50,8 +50,15 @@ type Config struct {
 	// <subdomain>.sandbox.localhost.
 	SandboxBaseDomain string
 
+	// Builder selects the container build engine ("nixpacks", "railpack").
+	// Defaults to "nixpacks".
+	Builder string
 	// NixpacksBin is the path to the nixpacks CLI binary.
 	NixpacksBin string
+	// RailpackBin is the path to the railpack CLI binary.
+	RailpackBin string
+	// BuildKitHost is the endpoint for BuildKit (e.g. unix:///var/run/buildkit/buildkitd.sock).
+	BuildKitHost string
 
 	// DevAuth, when true (default if GITHUB_CLIENT_ID is unset), lets requests
 	// authenticate with a fake GitHub identity so the deploy loop is testable
@@ -78,6 +85,20 @@ type Config struct {
 	// at the same time. Extra deploys wait in the queue (sandbox status
 	// 'queued') until a slot frees. Default 2.
 	BuildConcurrency int
+
+	// SandboxHardened enables stricter sandbox isolation (e.g. read-only rootfs + tmpfs).
+	SandboxHardened bool
+	// SandboxInit controls Docker --init (tini); enabled by default.
+	SandboxInit bool
+	// SandboxRuntime specifies an optional custom container runtime (e.g. "runsc" for gVisor).
+	SandboxRuntime string
+
+	// GatewayRateLimitRPS is the requests-per-second limit per IP on the gateway. Default 100.
+	GatewayRateLimitRPS int
+	// GatewayRateLimitBurst is the burst capacity per IP on the gateway. Default 200.
+	GatewayRateLimitBurst int
+	// GatewayMaxBodyBytes is the maximum allowed request body size in bytes. Default 32MB.
+	GatewayMaxBodyBytes int64
 }
 
 // Load reads .env (if present) and the process environment, then parses it
@@ -100,11 +121,20 @@ func Load() (*Config, error) {
 		GatewayPort:               envIntDefault("GATEWAY_PORT", 8090),
 		FrontendURL:               envDefault("FRONTEND_URL", "http://localhost:3000"),
 		SandboxBaseDomain:         envDefault("SANDBOX_BASE_DOMAIN", "sandbox.localhost"),
+		Builder:                   strings.ToLower(envDefault("BUILDER", "nixpacks")),
 		NixpacksBin:               envDefault("NIXPACKS_BIN", "nixpacks"),
+		RailpackBin:               envDefault("RAILPACK_BIN", "railpack"),
+		BuildKitHost:              envDefault("BUILDKIT_HOST", "unix:///var/run/buildkit/buildkitd.sock"),
 		MaxLifetimeSeconds:        envInt64Default("MAX_LIFETIME_SECONDS", 7*24*3600),
 		MaxActiveSandboxesPerUser: envIntDefault("MAX_ACTIVE_SANDBOXES_PER_USER", 3),
 		MaxRunningSandboxes:       envIntDefault("MAX_RUNNING_SANDBOXES", 6),
 		BuildConcurrency:          envIntDefault("BUILD_CONCURRENCY", 2),
+		SandboxHardened:           envBoolDefault("SANDBOX_HARDENED", false),
+		SandboxInit:               envBoolDefault("SANDBOX_INIT", true),
+		SandboxRuntime:            envDefault("SANDBOX_RUNTIME", ""),
+		GatewayRateLimitRPS:       envIntDefault("GATEWAY_RATE_LIMIT_RPS", 100),
+		GatewayRateLimitBurst:     envIntDefault("GATEWAY_RATE_LIMIT_BURST", 200),
+		GatewayMaxBodyBytes:       envInt64Default("GATEWAY_MAX_BODY_BYTES", 32*1024*1024),
 		DevAuth:                   os.Getenv("GITHUB_CLIENT_ID") == "",
 	}
 
@@ -112,6 +142,9 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	if cfg.Builder != "nixpacks" && cfg.Builder != "railpack" {
+		return nil, fmt.Errorf("config: BUILDER must be one of [nixpacks, railpack], got %q", cfg.Builder)
+	}
 	if cfg.DatabaseURL == "" || cfg.RedisURL == "" {
 		return nil, fmt.Errorf("config: DATABASE_URL and REDIS_URL are required (see .env.example)")
 	}
@@ -178,4 +211,16 @@ func envInt64Default(key string, fallback int64) int64 {
 		return fallback
 	}
 	return n
+}
+
+func envBoolDefault(key string, fallback bool) bool {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return fallback
+	}
+	return b
 }

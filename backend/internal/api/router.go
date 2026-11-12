@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -73,6 +74,45 @@ func (s *Server) Router() http.Handler {
 			"status":   "ok",
 			"time":     time.Now().UTC().Format(time.RFC3339),
 			"dev_auth": s.cfg.DevAuth,
+		})
+	})
+
+	// Production readiness probe: verifies Postgres, Redis, and Docker connectivity.
+	r.Get("/api/ready", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+
+		components := map[string]string{
+			"postgres": "ok",
+			"redis":    "ok",
+			"docker":   "ok",
+		}
+		var errs []string
+
+		if err := s.store.Ping(ctx); err != nil {
+			components["postgres"] = err.Error()
+			errs = append(errs, "postgres: "+err.Error())
+		}
+		if err := s.cache.Ping(ctx); err != nil {
+			components["redis"] = err.Error()
+			errs = append(errs, "redis: "+err.Error())
+		}
+		if err := s.orch.Ping(ctx); err != nil {
+			components["docker"] = err.Error()
+			errs = append(errs, "docker: "+err.Error())
+		}
+
+		status := "ok"
+		statusCode := http.StatusOK
+		if len(errs) > 0 {
+			status = "degraded"
+			statusCode = http.StatusServiceUnavailable
+		}
+
+		writeJSON(w, statusCode, map[string]any{
+			"status":     status,
+			"time":       time.Now().UTC().Format(time.RFC3339),
+			"components": components,
 		})
 	})
 

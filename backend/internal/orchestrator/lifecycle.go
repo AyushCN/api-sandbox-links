@@ -7,6 +7,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/api-sandbox-links/backend/internal/config"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/network"
@@ -77,9 +78,14 @@ func sandboxRestartPolicy() container.RestartPolicy {
 // above, and a restart policy that lets the platform recover a sandbox after
 // a daemon reboot. It is a pure function so the policy is unit-testable with
 // no Docker daemon in reach.
-func sandboxHostConfig() *container.HostConfig {
+func sandboxHostConfig(cfg *config.Config) *container.HostConfig {
 	pids := defaultPIDs // fresh pointer per call; the SDK only reads it
-	return &container.HostConfig{
+	initTrue := true
+	if cfg != nil && !cfg.SandboxInit {
+		initTrue = false
+	}
+	hc := &container.HostConfig{
+		Init: &initTrue,
 		Resources: container.Resources{
 			// Promoted fields (embedded struct) must be set via the Resources
 			// key inside a composite literal. MemorySwap == Memory disables
@@ -95,45 +101,50 @@ func sandboxHostConfig() *container.HostConfig {
 		RestartPolicy: sandboxRestartPolicy(),
 		LogConfig:     sandboxLogConfig(),
 	}
+
+	if cfg != nil {
+		if cfg.SandboxHardened {
+			hc.ReadonlyRootfs = true
+			hc.Tmpfs = map[string]string{
+				"/tmp": "rw,noexec,nosuid,size=64m",
+				"/run": "rw,noexec,nosuid,size=16m",
+			}
+		}
+		if cfg.SandboxRuntime != "" {
+			hc.Runtime = cfg.SandboxRuntime
+		}
+	}
+	return hc
 }
 
 // sidecarHostConfig builds the HostConfig every sidecar DB container runs
 // with resource limits and the isolation policy documented above.
 func sidecarHostConfig(bind string, engine string) *container.HostConfig {
 	pids := defaultPIDs // fresh pointer per call; the SDK only reads it
+	initTrue := true
+	hc := &container.HostConfig{
+		Init: &initTrue,
+		Resources: container.Resources{
+			Memory:     defaultMemoryLimit,
+			MemorySwap: defaultMemoryLimit, // MemorySwap == Memory disables swap
+			NanoCPUs:   int64(defaultCPUQuota * 1e9),
+			PidsLimit:  &pids,
+		},
+		CapDrop:       append([]string(nil), sidecarCapDrop...),
+		CapAdd:        append([]string(nil), sidecarCapAdd...),
+		SecurityOpt:   append([]string(nil), sidecarSecurityOpt...),
+		RestartPolicy: sandboxRestartPolicy(),
+		LogConfig:     sandboxLogConfig(),
+	}
 	switch engine {
 	case "postgres":
-		return &container.HostConfig{
-			Resources: container.Resources{
-				Memory:     defaultMemoryLimit,
-				MemorySwap: defaultMemoryLimit, // MemorySwap == Memory disables swap
-				NanoCPUs:   int64(defaultCPUQuota * 1e9),
-				PidsLimit:  &pids,
-			},
-			CapDrop:       append([]string(nil), sidecarCapDrop...),
-			CapAdd:        append([]string(nil), sidecarCapAdd...),
-			SecurityOpt:   append([]string(nil), sidecarSecurityOpt...),
-			RestartPolicy: sandboxRestartPolicy(),
-			LogConfig:     sandboxLogConfig(),
-			Binds:         []string{bind},
-		}
+		hc.Binds = []string{bind}
+		return hc
 	case "mysql":
-		return &container.HostConfig{
-			Resources: container.Resources{
-				Memory:     defaultMemoryLimit,
-				MemorySwap: defaultMemoryLimit, // MemorySwap == Memory disables swap
-				NanoCPUs:   int64(defaultCPUQuota * 1e9),
-				PidsLimit:  &pids,
-			},
-			CapDrop:       append([]string(nil), sidecarCapDrop...),
-			CapAdd:        append([]string(nil), sidecarCapAdd...),
-			SecurityOpt:   append([]string(nil), sidecarSecurityOpt...),
-			RestartPolicy: sandboxRestartPolicy(),
-			LogConfig:     sandboxLogConfig(),
-			Binds:         []string{fmt.Sprintf("%s:/var/lib/mysql", bind)},
-		}
+		hc.Binds = []string{fmt.Sprintf("%s:/var/lib/mysql", bind)}
+		return hc
 	default:
-		return &container.HostConfig{}
+		return &container.HostConfig{Init: &initTrue}
 	}
 }
 
@@ -245,7 +256,7 @@ func (o *Orchestrator) RunSandbox(ctx context.Context, opts RunOptions) (*RunRes
 	if opts.User != "" {
 		cc.User = opts.User
 	}
-	hc := sandboxHostConfig()
+	hc := sandboxHostConfig(o.cfg)
 	nc := &network.NetworkingConfig{
 		EndpointsConfig: map[string]*network.EndpointSettings{
 			netName(opts.SandboxID): {NetworkID: ""},

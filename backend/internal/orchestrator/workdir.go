@@ -18,6 +18,9 @@ import (
 // sandbox is never touched — its directory may hold user edits, and it is
 // reclaimed by the expiry reaper at expires_at instead.
 func (d *Deployer) cleanupWorkDirIfDestroyed(sandboxID, subdomain string) bool {
+	if d == nil || d.store == nil {
+		return false
+	}
 	fresh, err := d.store.GetSandbox(sandboxID)
 	if err != nil || fresh.DestroyedAt == nil {
 		// Not destroyed (or row unreadable): never delete on uncertainty.

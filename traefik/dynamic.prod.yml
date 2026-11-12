@@ -1,0 +1,70 @@
+# Production dynamic configuration for Traefik edge router.
+#
+# Routes all incoming wildcard sandbox traffic to the internal wake-on-request gateway (:8090).
+# Applies TLS termination, strict security headers, and edge rate limiting.
+
+http:
+  middlewares:
+    # Force HTTPS redirect for port 80 traffic
+    redirect-to-https:
+      redirectScheme:
+        scheme: https
+        permanent: true
+
+    # Production security headers
+    sec-headers:
+      headers:
+        sslRedirect: true
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        stsPreload: true
+        contentTypeNosniff: true
+        browserXssFilter: true
+        customFrameOptionsValue: "SAMEORIGIN"
+        referrerPolicy: "strict-origin-when-cross-origin"
+
+    # Edge rate limiting to mitigate denial of service
+    edge-rate-limit:
+      rateLimit:
+        average: 100
+        burst: 200
+        period: 1s
+
+  routers:
+    # HTTP -> HTTPS redirection
+    http-catchall:
+      rule: "HostRegexp(`{subdomain:[a-z0-9-]+}.{domain:.+}`)"
+      entrypoints:
+        - web
+      middlewares:
+        - redirect-to-https
+      service: noop-service
+
+    # Wildcard sandbox router over HTTPS
+    sandbox-edge-secure:
+      rule: "HostRegexp(`{subdomain:[a-z0-9-]+}.{domain:.+}`)"
+      entrypoints:
+        - websecure
+      middlewares:
+        - sec-headers
+        - edge-rate-limit
+      tls:
+        certResolver: le-wildcard
+        domains:
+          - main: "sandbox.${DOMAIN}"
+            sans:
+              - "*.sandbox.${DOMAIN}"
+      service: sandbox-gateway
+
+  services:
+    sandbox-gateway:
+      loadBalancer:
+        servers:
+          # In single-host production, Traefik forwards to the host gateway listener at :8090
+          - url: "http://host.docker.internal:8090"
+
+    noop-service:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:8080"
+

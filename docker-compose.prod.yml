@@ -1,0 +1,99 @@
+# Production compose blueprint for API Sandbox Links infrastructure on Linux.
+#
+# Runs:
+#   - PostgreSQL 16 (persistent data volume)
+#   - Redis 7 with AOF persistence (persistent state volume)
+#   - Traefik v3.1 with automated Let's Encrypt wildcard TLS (DNS-01)
+#   - BuildKit daemon (isolated container with persistent build cache)
+#
+# The Go backend binary runs as a systemd service on the host or inside a container.
+#
+# Usage:
+#   docker compose -f docker-compose.prod.yml up -d
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: sandbox-platform-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-in-production}
+      POSTGRES_DB: ${POSTGRES_DB:-sandbox_platform}
+    ports:
+      # Expose only on loopback so external internet cannot reach database port directly
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-user} -d ${POSTGRES_DB:-sandbox_platform}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: sandbox-platform-redis
+    restart: unless-stopped
+    # Append-Only File (AOF) ensures hot state (idle TTL keys) survives unexpected restarts
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  traefik:
+    image: traefik:v3.1
+    container_name: sandbox-platform-traefik
+    restart: unless-stopped
+    command:
+      - --configFile=/etc/traefik/traefik.prod.yml
+    environment:
+      - DOMAIN=${DOMAIN:-example.com}
+      - ACME_EMAIL=${ACME_EMAIL:-admin@example.com}
+      - ACME_DNS_PROVIDER=${ACME_DNS_PROVIDER:-cloudflare}
+      # DNS provider credentials passed through to Traefik ACME:
+      # Cloudflare:
+      - CF_DNS_API_TOKEN=${CF_DNS_API_TOKEN:-}
+      # AWS Route53 (uncomment if using route53):
+      # - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      # - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      # - AWS_REGION=${AWS_REGION:-}
+      # DigitalOcean (uncomment if using digitalocean):
+      # - DO_AUTH_TOKEN=${DO_AUTH_TOKEN:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./traefik/traefik.prod.yml:/etc/traefik/traefik.prod.yml:ro
+      - ./traefik/dynamic.prod.yml:/etc/traefik/dynamic.prod.yml:ro
+      - traefik_acme:/etc/traefik/acme
+    extra_hosts:
+      # Resolves host gateway listener on port :8090
+      - "host.docker.internal:host-gateway"
+
+  buildkit:
+    image: moby/buildkit:v0.19.0-rootless
+    container_name: sandbox-platform-buildkit
+    restart: unless-stopped
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+    environment:
+      - BUILDKITD_FLAGS=--oci-worker-no-process-sandbox
+    ports:
+      - "127.0.0.1:1234:1234"
+    volumes:
+      - buildkit_data:/home/user/.local/share/buildkit
+
+volumes:
+  postgres_data:
+  redis_data:
+  traefik_acme:
+  buildkit_data:
+

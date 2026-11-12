@@ -35,6 +35,14 @@ func New(ctx context.Context, url string) (*Redis, error) {
 	return &Redis{client: client}, nil
 }
 
+// Ping verifies connectivity to Redis.
+func (r *Redis) Ping(ctx context.Context) error {
+	if r == nil || r.client == nil {
+		return fmt.Errorf("cache: redis client not initialized")
+	}
+	return r.client.Ping(ctx).Err()
+}
+
 // ---- last-request-at markers (idle timeout) -----------------------------
 //
 // Each request through the sandbox gateway calls Touch on the sandbox's key

@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -20,6 +21,18 @@ type Store struct {
 // NewStore returns a Store wrapping the given gorm handle.
 func NewStore(db *gorm.DB) *Store {
 	return &Store{db: db}
+}
+
+// Ping verifies database connectivity.
+func (s *Store) Ping(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("db: store not initialized")
+	}
+	sqlDB, err := s.db.DB()
+	if err != nil {
+		return fmt.Errorf("db: accessing underlying sql.DB: %w", err)
+	}
+	return sqlDB.PingContext(ctx)
 }
 
 func newID() string {
