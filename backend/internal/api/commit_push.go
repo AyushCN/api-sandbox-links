@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/api-sandbox-links/backend/internal/db"
 	"github.com/api-sandbox-links/backend/internal/git"
 )
 
@@ -16,10 +17,10 @@ import (
 // mishap in the editor sandbox must not clobber the user's real work. Pushing
 // directly to the original branch requires the caller to explicitly opt in.
 type commitPushRequest struct {
-	Message        string `json:"message"`
-	Branch         string `json:"branch"`           // optional target branch name (new)
-	DirectToOriginal bool `json:"direct_to_original"` // explicit opt-in toggle
-	Force          bool   `json:"force"`
+	Message          string `json:"message"`
+	Branch           string `json:"branch"`             // optional target branch name (new)
+	DirectToOriginal bool   `json:"direct_to_original"` // explicit opt-in toggle
+	Force            bool   `json:"force"`
 }
 
 // handleCommitPush stages the working tree, commits with the given message,
@@ -35,7 +36,7 @@ func (s *Server) handleCommitPush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.touchSandbox(r.Context(), sb)
-	if sb.DestroyedAt != nil {
+	if sb.DestroyedAt != nil || sb.Status == db.StatusDeleted || sb.Status == db.StatusExpired {
 		writeErr(w, http.StatusConflict, "sandbox is destroyed; nothing to commit")
 		return
 	}
@@ -86,9 +87,9 @@ func (s *Server) handleCommitPush(w http.ResponseWriter, r *http.Request) {
 		slog.String("branch", targetBranch), slog.String("hash", hash))
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"commit":  hash,
-		"branch":  targetBranch,
-		"direct":  req.DirectToOriginal,
+		"commit":    hash,
+		"branch":    targetBranch,
+		"direct":    req.DirectToOriginal,
 		"pushed_at": time.Now(),
 	})
 }

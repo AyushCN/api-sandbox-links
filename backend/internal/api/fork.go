@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/api-sandbox-links/backend/internal/db"
@@ -16,6 +16,9 @@ import (
 	"github.com/api-sandbox-links/backend/internal/orchestrator"
 	"github.com/google/uuid"
 )
+
+// forkLocks prevents concurrent file mutations while a sandbox is being forked.
+var forkLocks sync.Map
 
 // handleForkSandbox creates a child sandbox that is an independent copy of the
 // parent: its own sandbox row (parent_sandbox_id set), a deep copy of the
@@ -38,6 +41,11 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "cannot fork a destroyed sandbox")
 		return
 	}
+	if _, already := forkLocks.LoadOrStore(parent.ID, struct{}{}); already {
+		writeErr(w, http.StatusConflict, "fork already in progress for this sandbox")
+		return
+	}
+	defer forkLocks.Delete(parent.ID)
 
 	// Child lifetime = parent's remaining lifetime, clamped to [min, max].
 	//
@@ -156,63 +164,4 @@ func (s *Server) forkFailed(ctx context.Context, child *db.Sandbox, cause error)
 		"status": string(db.StatusFailed),
 	})
 	_ = ctx
-}
-
-// copyDir recursively copies src into dst, preserving permission bits. This is
-// the deliberate, file-level fork copy (documented simplification of true
-// block-level Copy-on-Write).
-func copyDir(src, dst string) error {
-	if err := os.MkdirAll(dst, 0o755); err != nil {
-		return err
-	}
-	entries, err := os.ReadDir(src)
-	if err != nil {
-		return err
-	}
-	for _, e := range entries {
-		srcPath := filepath.Join(src, e.Name())
-		dstPath := filepath.Join(dst, e.Name())
-		switch {
-		case e.IsDir():
-			// Skip git internals: the child gets its own remotes from the parent
-			// branch config. Keeping the copy free of .git avoids stale refs.
-			if e.Name() == ".git" {
-				continue
-			}
-			if err := copyDir(srcPath, dstPath); err != nil {
-				return err
-			}
-		case e.Type()&os.ModeSymlink != 0:
-			// Copy symlinks as links, not as their targets.
-			target, err := os.Readlink(srcPath)
-			if err != nil {
-				return err
-			}
-			if err := os.Symlink(target, dstPath); err != nil {
-				return err
-			}
-		default:
-			if err := copyFile(srcPath, dstPath); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	if _, err := io.Copy(out, in); err != nil {
-		return err
-	}
-	return nil
 }

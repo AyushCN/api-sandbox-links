@@ -342,3 +342,97 @@ func TestDeployerRecoverStuckBuildsIntegration(t *testing.T) {
 		t.Errorf("expected sandbox status failed, got %s", fresh.Status)
 	}
 }
+
+// TestDeployLifecycleRaceWithDeletionUsingBarriers tests the deterministic sequence:
+// 1. Deployment passes its destroyed-state check after cloning.
+// 2. Deployment pauses before runtime activation (during build phase via barrier file).
+// 3. Deletion and cleanup occur while deployment is paused.
+// 4. Deployment is resumed.
+// 5. The conditional database update rejects activation (ErrSandboxDestroyed).
+// 6. Deployer tears down container and removes workspace directory so no resources remain.
+func TestDeployLifecycleRaceWithDeletionUsingBarriers(t *testing.T) {
+	store, gdb := lifecycleEnv(t)
+	sb := lifecycleSandbox(t, store, gdb, "race-barrier", 880005)
+
+	barrierDir := t.TempDir()
+	pausedFile := filepath.Join(barrierDir, "deploy_paused")
+	resumeFile := filepath.Join(barrierDir, "deploy_resume")
+
+	// Nixpacks fake script that signals pausedFile and waits for resumeFile
+	buildBody := fmt.Sprintf(": > '%s'\nwhile [ ! -f '%s' ]; do sleep 0.05; done\nexit 0\n", pausedFile, resumeFile)
+	d, workRoot := lifecycleDeployer(t, store, lifecycleNixpacks(t, buildBody))
+
+	// Pre-seed workdir so clone is skipped and passes destroyed-state check
+	workDir := lifecycleSeedWorkDir(t, workRoot, sb, "index.js", "console.log('hi')")
+
+	deployDone := make(chan error, 1)
+	go func() {
+		deployDone <- d.DeploySandbox(context.Background(), sb, DeployOptions{Trigger: db.TriggerSaveRedeploy})
+	}()
+
+	// 1 & 2. Wait until deployment reaches the build pause barrier (after initial destroyed check)
+	waitForFileDeploy(t, pausedFile, 10*time.Second)
+
+	// 3. Begin sandbox deletion and cleanup while deployment is paused
+	now := time.Now().UTC()
+	if err := store.UpdateSandbox(sb.ID, map[string]any{
+		"status":       string(db.StatusDeleted),
+		"destroyed_at": now,
+	}); err != nil {
+		t.Fatalf("failed to update sandbox to destroyed: %v", err)
+	}
+	if err := RemoveSandboxWorkDir(workRoot, sb.Subdomain); err != nil {
+		t.Fatalf("failed to remove workdir: %v", err)
+	}
+
+	// Verify workspace directory is deleted
+	if _, err := os.Stat(workDir); !os.IsNotExist(err) {
+		t.Fatalf("expected workdir to be deleted during teardown")
+	}
+
+	// 4. Resume deployment
+	if err := os.WriteFile(resumeFile, []byte("ok"), 0o644); err != nil {
+		t.Fatalf("failed to write resumeFile: %v", err)
+	}
+
+	// Wait for DeploySandbox to finish
+	select {
+	case err := <-deployDone:
+		_ = err
+	case <-time.After(15 * time.Second):
+		t.Fatal("DeploySandbox timed out waiting for completion")
+	}
+
+	// 5. Verify deployment is marked failed in DB with explanation
+	deps, err := store.ListDeployments(sb.ID)
+	if err != nil {
+		t.Fatalf("ListDeployments: %v", err)
+	}
+	if len(deps) == 0 {
+		t.Fatal("expected at least one deployment record")
+	}
+	latest := deps[0]
+	if latest.Status != string(db.DeployFailed) {
+		t.Errorf("expected deployment status %s, got %s", db.DeployFailed, latest.Status)
+	}
+	if !strings.Contains(latest.LogExcerpt, "sandbox was destroyed while this deployment was still building") {
+		t.Errorf("expected destroyed excerpt in deployment log, got %s", latest.LogExcerpt)
+	}
+
+	// 6. Verify sandbox status in DB remains deleted (NOT resurrected to running!)
+	fresh, err := store.GetSandbox(sb.ID)
+	if err != nil {
+		t.Fatalf("GetSandbox: %v", err)
+	}
+	if fresh.Status != db.StatusDeleted {
+		t.Errorf("expected sandbox status to remain %s, got %s", db.StatusDeleted, fresh.Status)
+	}
+	if fresh.DestroyedAt == nil {
+		t.Errorf("expected DestroyedAt to be preserved")
+	}
+
+	// Verify workdir does NOT exist on disk
+	if _, err := os.Stat(workDir); !os.IsNotExist(err) {
+		t.Errorf("work directory remains on disk after destroyed deploy: %v", err)
+	}
+}

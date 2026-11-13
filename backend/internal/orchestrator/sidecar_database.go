@@ -170,12 +170,23 @@ func (o *Orchestrator) WaitForDatabase(ctx context.Context, sandboxID, container
 }
 
 func fileExists(dir string, elems ...string) bool {
-	_, err := os.Stat(filepath.Join(append([]string{dir}, elems...)...))
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return false
+	}
+	defer root.Close()
+	target := filepath.Join(elems...)
+	_, err = root.Stat(target)
 	return err == nil
 }
 
 func readEnvExample(dir string) string {
-	b, err := os.ReadFile(filepath.Join(dir, ".env.example"))
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return ""
+	}
+	defer root.Close()
+	b, err := root.ReadFile(".env.example")
 	if err != nil {
 		return ""
 	}
@@ -183,9 +194,14 @@ func readEnvExample(dir string) string {
 }
 
 func readFiles(dir string, names ...string) string {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return ""
+	}
+	defer root.Close()
 	var sb strings.Builder
 	for _, n := range names {
-		b, err := os.ReadFile(filepath.Join(dir, n))
+		b, err := root.ReadFile(n)
 		if err == nil {
 			sb.Write(b)
 			sb.WriteString("\n")

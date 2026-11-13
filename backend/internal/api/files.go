@@ -3,13 +3,19 @@ package api
 import (
 	"context"
 	"encoding/base64"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/api-sandbox-links/backend/internal/db"
 	"github.com/api-sandbox-links/backend/internal/orchestrator"
@@ -22,6 +28,15 @@ type fileEntry struct {
 	Size int64  `json:"size,omitempty"`
 }
 
+// FileContentResult holds the data and metadata for an inspected file.
+type FileContentResult struct {
+	Path    string
+	Data    []byte
+	Size    int64
+	Binary  bool
+	ModTime time.Time
+}
+
 // handleFileTree lists every file under the sandbox's working directory,
 // recursively and sorted, so the editor sidebar can render a simple tree.
 func (s *Server) handleFileTree(w http.ResponseWriter, r *http.Request) {
@@ -29,38 +44,58 @@ func (s *Server) handleFileTree(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	root := filepath.Join(s.cfg.SandboxWorkDir, sb.Subdomain)
-	if _, err := os.Stat(root); os.IsNotExist(err) {
+	if sb.DestroyedAt != nil || sb.Status == db.StatusDeleted || sb.Status == db.StatusExpired {
+		writeErr(w, http.StatusConflict, "sandbox is destroyed; nothing to read")
+		return
+	}
+	rootHandle, err := s.sandboxRoot(sb.ID)
+	if err != nil {
 		writeErr(w, http.StatusNotFound, "working directory not found (sandbox may still be building or was destroyed)")
 		return
 	}
+	defer rootHandle.Close()
 
+	out, err := readFileTree(rootHandle)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not walk working directory")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"files": out})
+}
+
+// readFileTree lists all non-git files within the workspace root handle.
+func readFileTree(rootHandle *os.Root) ([]fileEntry, error) {
 	var out []fileEntry
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+	err := fs.WalkDir(rootHandle.FS(), ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil // skip unreadable subtrees (e.g. node_modules permission races)
 		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil || rel == "." {
+		if path == "." {
 			return nil
 		}
 		// The git internals are never editable through the UI; shows less noise.
-		if strings.HasPrefix(rel, ".git") {
+		if isGitPath(path) {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
 			return nil
 		}
 		out = append(out, fileEntry{
-			Path: filepath.ToSlash(rel),
-			Dir:  info.IsDir(),
+			Path: filepath.ToSlash(path),
+			Dir:  d.IsDir(),
 			Size: info.Size(),
 		})
 		return nil
 	})
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not walk working directory")
-		return
+		return nil, err
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
-	writeJSON(w, http.StatusOK, map[string]any{"files": out})
+	return out, nil
 }
 
 // handleFileContent returns one file's content. Binary files are base64-encoded
@@ -70,36 +105,91 @@ func (s *Server) handleFileContent(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	root, err := s.sandboxRoot(sb.ID)
+	if sb.DestroyedAt != nil || sb.Status == db.StatusDeleted || sb.Status == db.StatusExpired {
+		writeErr(w, http.StatusConflict, "sandbox is destroyed; nothing to read")
+		return
+	}
+	rootHandle, err := s.sandboxRoot(sb.ID)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "working directory not found")
 		return
 	}
+	defer rootHandle.Close()
+
 	rel := r.URL.Query().Get("path")
-	full, err := safeJoin(root, rel)
+	res, err := readFileContent(rootHandle, rel)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	data, err := os.ReadFile(full)
-	if err != nil {
+		var hErr httpErr
+		if errors.As(err, &hErr) {
+			writeErr(w, http.StatusBadRequest, hErr.Error())
+			return
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			writeErr(w, http.StatusNotFound, "file not found")
+			return
+		}
 		writeErr(w, http.StatusNotFound, "file not found")
 		return
 	}
-	info, _ := os.Stat(full)
-	isBinary := isBinary(data)
+
 	resp := map[string]any{
-		"path":   rel,
-		"size":   len(data),
-		"binary": isBinary,
-		"mtime":  info.ModTime(),
+		"path":   res.Path,
+		"size":   res.Size,
+		"binary": res.Binary,
+		"mtime":  res.ModTime,
 	}
-	if isBinary {
-		resp["content"] = base64.StdEncoding.EncodeToString(data)
+	if res.Binary {
+		resp["content"] = base64.StdEncoding.EncodeToString(res.Data)
 	} else {
-		resp["content"] = string(data)
+		resp["content"] = string(res.Data)
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// readFileContent safely opens and reads a file strictly confined within rootHandle.
+func readFileContent(rootHandle *os.Root, relPath string) (*FileContentResult, error) {
+	cleanPath, err := validateRelativePath(relPath)
+	if err != nil {
+		return nil, err
+	}
+	if isGitPath(cleanPath) {
+		return nil, httpErr("git internals are not accessible")
+	}
+
+	f, err := rootHandle.Open(filepath.FromSlash(cleanPath))
+	if err != nil {
+		if isPathEscape(err) {
+			return nil, httpErr("path escapes the working directory")
+		}
+		return nil, err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, os.ErrNotExist
+	}
+	if info.IsDir() {
+		return nil, httpErr("path is a directory")
+	}
+
+	if isFdInGit(f, rootHandle.Name()) {
+		return nil, httpErr("git internals are not accessible")
+	}
+
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, fmt.Errorf("could not read file: %w", err)
+	}
+
+	isBin := isBinary(data)
+	return &FileContentResult{
+		Path:    cleanPath,
+		Data:    data,
+		Size:    int64(len(data)),
+		Binary:  isBin,
+		ModTime: info.ModTime(),
+	}, nil
 }
 
 // saveFileRequest is the body of PUT /file.
@@ -126,8 +216,12 @@ func (s *Server) handleSaveFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.touchSandbox(r.Context(), sb)
-	if sb.DestroyedAt != nil {
+	if sb.DestroyedAt != nil || sb.Status == db.StatusDeleted || sb.Status == db.StatusExpired {
 		writeErr(w, http.StatusConflict, "sandbox is destroyed; nothing to edit")
+		return
+	}
+	if _, forking := forkLocks.Load(sb.ID); forking {
+		writeErr(w, http.StatusConflict, "sandbox is currently being forked; please retry")
 		return
 	}
 	var req saveFileRequest
@@ -136,24 +230,12 @@ func (s *Server) handleSaveFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	root, err := s.sandboxRoot(sb.ID)
+	rootHandle, err := s.sandboxRoot(sb.ID)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "working directory not found (sandbox may still be building)")
 		return
 	}
-	full, err := safeJoin(root, req.Path)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if strings.HasPrefix(filepath.Clean(req.Path), ".git") {
-		writeErr(w, http.StatusBadRequest, "git internals are not editable")
-		return
-	}
-	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not create directories")
-		return
-	}
+	defer rootHandle.Close()
 
 	var data []byte
 	if req.IsBase64 {
@@ -165,11 +247,19 @@ func (s *Server) handleSaveFile(w http.ResponseWriter, r *http.Request) {
 	} else {
 		data = []byte(req.Content)
 	}
-	if err := os.WriteFile(full, data, 0o644); err != nil {
+
+	if err := saveFileContent(rootHandle, req.Path, data); err != nil {
+		var hErr httpErr
+		if errors.As(err, &hErr) {
+			writeErr(w, http.StatusBadRequest, hErr.Error())
+			return
+		}
 		writeErr(w, http.StatusInternalServerError, "could not write file")
 		return
 	}
-	_ = s.store.RecordFileEdit(sb.ID, req.Path, user.ID)
+
+	cleanPath, _ := validateRelativePath(req.Path)
+	_ = s.store.RecordFileEdit(sb.ID, cleanPath, user.ID)
 
 	// Trigger the redeploy in the background, deduped so rapid-fire saves don't
 	// start three rebuilds at once.
@@ -185,32 +275,145 @@ func (s *Server) handleSaveFile(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"saved": true, "path": req.Path, "redeploying": true})
+	writeJSON(w, http.StatusOK, map[string]any{"saved": true, "path": cleanPath, "redeploying": true})
 }
 
-// sandboxRoot resolves the sandbox's on-disk working directory.
-func (s *Server) sandboxRoot(sandboxID string) (string, error) {
+// saveFileContent securely writes data to a file strictly confined within rootHandle.
+// It guarantees that NO symbolic links (internal or external, intermediate or terminal)
+// are followed during path resolution, preventing arbitrary file overwrite and write-through
+// symlink redirection atomically.
+//
+// Truncation ordering:
+// 1. Open without O_TRUNC (using O_NONBLOCK to prevent hanging on FIFOs).
+// 2. Verify descriptor is a regular file.
+// 3. Verify descriptor does not resolve to .git.
+// 4. Truncate descriptor.
+// 5. Write data.
+func saveFileContent(rootHandle *os.Root, relPath string, data []byte) error {
+	cleanPath, err := validateRelativePath(relPath)
+	if err != nil {
+		return err
+	}
+	if isGitPath(cleanPath) {
+		return httpErr("git internals are not editable")
+	}
+
+	relOS := filepath.FromSlash(cleanPath)
+
+	f, err := openNoSymlinkWrite(rootHandle, relOS)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if isFdInGit(f, rootHandle.Name()) {
+		return httpErr("git internals are not editable")
+	}
+
+	// Safe to truncate now that descriptor is confirmed to be an isolated regular file.
+	if err := f.Truncate(0); err != nil {
+		return fmt.Errorf("could not truncate file: %w", err)
+	}
+
+	if _, err := f.Write(data); err != nil {
+		return fmt.Errorf("could not write file: %w", err)
+	}
+	return f.Close()
+}
+
+// sandboxRoot opens the sandbox's on-disk working directory as an *os.Root.
+// The caller is responsible for calling Close() on the returned Root.
+func (s *Server) sandboxRoot(sandboxID string) (*os.Root, error) {
 	sb, err := s.store.GetSandbox(sandboxID)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	root := filepath.Join(s.cfg.SandboxWorkDir, sb.Subdomain)
-	if _, err := os.Stat(root); err != nil {
-		return "", err
+	return openSandboxRoot(s.cfg.SandboxWorkDir, sb.Subdomain)
+}
+
+// openSandboxRoot opens the sandbox working directory beneath workDir as an *os.Root.
+// It verifies that subdomain is valid, exists, and is a real directory (not a symlink).
+func openSandboxRoot(workDir, subdomain string) (*os.Root, error) {
+	subdomain = strings.TrimSpace(subdomain)
+	if subdomain == "" {
+		return nil, errors.New("empty subdomain")
 	}
-	return root, nil
+	if subdomain == "." || subdomain == ".." || strings.Contains(subdomain, "/") || strings.Contains(subdomain, "\\") || strings.Contains(subdomain, "..") {
+		return nil, errors.New("unsafe subdomain")
+	}
+
+	parentRoot, err := os.OpenRoot(workDir)
+	if err != nil {
+		return nil, err
+	}
+	defer parentRoot.Close()
+
+	fi, err := parentRoot.Lstat(subdomain)
+	if err != nil {
+		return nil, err
+	}
+	if !fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("sandbox workspace is not a valid directory")
+	}
+
+	return parentRoot.OpenRoot(subdomain)
+}
+
+// validateRelativePath validates that rel is a clean relative path that cannot
+// escape the workspace root lexically.
+func validateRelativePath(rel string) (string, error) {
+	rel = strings.TrimSpace(rel)
+	if rel == "" {
+		return "", httpErr("path is required")
+	}
+	if strings.ContainsRune(rel, 0) {
+		return "", httpErr("path contains invalid characters")
+	}
+	// Reject colons (Windows drive letters, ADS, scheme prefixes)
+	if strings.Contains(rel, ":") {
+		return "", httpErr("path must be relative and inside the working directory")
+	}
+	// Normalize backslashes to forward slashes across all platforms
+	normalized := strings.ReplaceAll(rel, "\\", "/")
+	if strings.HasPrefix(normalized, "/") {
+		return "", httpErr("path must be relative and inside the working directory")
+	}
+
+	clean := path.Clean(normalized)
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
+		return "", httpErr("path must be relative and inside the working directory")
+	}
+	return clean, nil
+}
+
+// isGitPath reports whether the path targets .git internals.
+func isGitPath(path string) bool {
+	clean := filepath.ToSlash(filepath.Clean(filepath.FromSlash(path)))
+	return clean == ".git" || strings.HasPrefix(clean, ".git/")
+}
+
+// isPathEscape reports whether err was caused by an attempt to escape an os.Root.
+func isPathEscape(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pe *os.PathError
+	if errors.As(err, &pe) {
+		if pe.Err != nil && strings.Contains(strings.ToLower(pe.Err.Error()), "escapes") {
+			return true
+		}
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "escapes")
 }
 
 // safeJoin combines root with a user-supplied relative path, refusing any path
 // that would escape root via ".." or absolute segments.
 func safeJoin(root, rel string) (string, error) {
-	rel = filepath.FromSlash(rel)
-	clean := filepath.Clean(rel)
-	if clean == "." || filepath.IsAbs(clean) || strings.HasPrefix(clean, "..") {
-		return "", httpErr("path must be relative and inside the working directory")
+	cleanRel, err := validateRelativePath(rel)
+	if err != nil {
+		return "", err
 	}
-	full := filepath.Join(root, clean)
-	// Double-check the resolved path stays under root.
+	full := filepath.Clean(filepath.Join(root, filepath.FromSlash(cleanRel)))
 	relRoot, err := filepath.Rel(root, full)
 	if err != nil || relRoot == ".." || strings.HasPrefix(relRoot, ".."+string(filepath.Separator)) {
 		return "", httpErr("path escapes the working directory")

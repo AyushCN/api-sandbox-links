@@ -47,12 +47,14 @@ func (d *Deployer) cleanupWorkDirIfDestroyed(sandboxID, subdomain string) bool {
 //   - the cleaned target must be a strict child of the cleaned root,
 //   - the root itself is never removed,
 //   - a missing directory is success (cleanup paths are idempotent; repeated
-//     cancellation/destroy must not turn into an error).
+//     cancellation/destroy must not turn into an error),
+//   - confined to workRoot via os.Root directory handle to prevent following symlinks outside.
 func RemoveSandboxWorkDir(workRoot, subdomain string) error {
-	if strings.TrimSpace(subdomain) == "" {
+	subdomain = strings.TrimSpace(subdomain)
+	if subdomain == "" {
 		return errors.New("empty subdomain")
 	}
-	if strings.Contains(subdomain, "/") || strings.Contains(subdomain, "\\") || strings.Contains(subdomain, "..") {
+	if subdomain == "." || subdomain == ".." || strings.Contains(subdomain, "/") || strings.Contains(subdomain, "\\") || strings.Contains(subdomain, "..") {
 		return errors.New("unsafe subdomain")
 	}
 	root := filepath.Clean(workRoot)
@@ -64,8 +66,37 @@ func RemoveSandboxWorkDir(workRoot, subdomain string) error {
 	if target == root {
 		return errors.New("refusing to remove work root")
 	}
-	if err := os.RemoveAll(target); err != nil && !os.IsNotExist(err) {
+
+	rootHandle, err := os.OpenRoot(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer rootHandle.Close()
+
+	if err := rootHandle.RemoveAll(subdomain); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if isPathEscape(err) {
+			return errors.New("path outside work root")
+		}
 		return err
 	}
 	return nil
+}
+
+func isPathEscape(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pe *os.PathError
+	if errors.As(err, &pe) {
+		if pe.Err != nil && strings.Contains(strings.ToLower(pe.Err.Error()), "escapes") {
+			return true
+		}
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "escapes")
 }
