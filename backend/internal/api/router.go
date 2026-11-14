@@ -88,6 +88,7 @@ func (s *Server) Router() http.Handler {
 			"dev_auth": s.cfg.DevAuth,
 		})
 	})
+	r.Get("/api/ready", s.handleReady)
 
 	// Public auth endpoints.
 	r.Get("/api/auth/github", s.handleAuthStart)
@@ -154,6 +155,7 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 		next.ServeHTTP(ww, r)
 		s.logger.Info("http",
+			slog.String("request_id", middleware.GetReqID(r.Context())),
 			slog.String("method", r.Method),
 			slog.String("path", r.URL.Path),
 			slog.Int("status", ww.Status()),

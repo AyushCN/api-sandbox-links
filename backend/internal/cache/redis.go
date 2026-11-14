@@ -134,3 +134,8 @@ func DecodeStatFrame(raw []byte) (*StatFrame, error) {
 	}
 	return &f, nil
 }
+
+// Ping verifies Redis is reachable; used by readiness and the doctor.
+func (r *Redis) Ping(ctx context.Context) error {
+	return r.client.Ping(ctx).Err()
+}

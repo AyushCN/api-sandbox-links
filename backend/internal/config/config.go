@@ -82,6 +82,24 @@ type Config struct {
 	// at the same time. Extra deploys wait in the queue (sandbox status
 	// 'queued') until a slot frees. Default 2.
 	BuildConcurrency int
+
+	// BuildMode is how images are built. "host-docker" runs nixpacks/docker on
+	// the host; this is the only supported production mode and it is explicitly
+	// allowed (with a startup warning) because the backend already trusts the
+	// host Docker daemon for every sandbox. "disabled" is useful for a control
+	// plane that should not build.
+	BuildMode string
+	// BuildCPUQuota / BuildMemoryMB bound the build container. They are advisory
+	// for the Docker CLI and are always paired with the process-group timeout.
+	BuildCPUQuota float64
+	BuildMemoryMB int
+	// DiskMinFreeGB refuses new deploys when the sandbox work filesystem has
+	// less free space. The friendly error is easier to act on than a half-built
+	// image filling the disk.
+	DiskMinFreeGB int
+	// ImagePruneHours is the age at which the hygiene worker prunes dangling
+	// images and build cache.
+	ImagePruneHours int
 }
 
 // Load reads .env (if present) and the process environment, then parses it
@@ -115,34 +133,68 @@ func Load() (*Config, error) {
 		MaxActiveSandboxesPerUser: envIntDefault("MAX_ACTIVE_SANDBOXES_PER_USER", 3),
 		MaxRunningSandboxes:       envIntDefault("MAX_RUNNING_SANDBOXES", 6),
 		BuildConcurrency:          envIntDefault("BUILD_CONCURRENCY", 2),
+		BuildMode:                 envDefault("BUILD_MODE", "host-docker"),
+		BuildCPUQuota:             envFloatDefault("BUILD_CPU_QUOTA", 1.5),
+		BuildMemoryMB:             envIntDefault("BUILD_MEMORY_MB", 2048),
+		DiskMinFreeGB:             envIntDefault("DISK_MIN_FREE_GB", 5),
+		ImagePruneHours:           envIntDefault("IMAGE_PRUNE_HOURS", 24),
 		// DevAuth is opt-in and can never be enabled in production, even if the
 		// flag is set. Otherwise a forgotten DEV_AUTH=true would ship a bypass.
 		DevAuth: devAuth && appEnv != "production",
 	}
 
+	// Collect every problem before returning. A startup that lists all missing
+	// settings is far quicker to fix than one that reveals them one restart at
+	// a time.
+	var problems []string
 	if err := cfg.decryptKey(); err != nil {
-		return nil, err
+		problems = append(problems, err.Error())
 	}
-
-	if cfg.DatabaseURL == "" || cfg.RedisURL == "" {
-		return nil, fmt.Errorf("config: DATABASE_URL and REDIS_URL are required (see .env.example)")
+	if cfg.DatabaseURL == "" {
+		problems = append(problems, "DATABASE_URL is required")
 	}
-	if len(cfg.EncryptionKey) == 0 {
-		return nil, fmt.Errorf("config: SECRETS_ENCRYPTION_KEY must be a base64-encoded 32-byte key")
+	if cfg.RedisURL == "" {
+		problems = append(problems, "REDIS_URL is required")
 	}
-	if cfg.AppEnv == "production" && (cfg.GitHubClientID == "" || cfg.GitHubClientSecret == "") {
-		return nil, fmt.Errorf("config: APP_ENV=production requires GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET")
+	if len(cfg.EncryptionKey) == 0 && os.Getenv("SECRETS_ENCRYPTION_KEY") == "" {
+		problems = append(problems, "SECRETS_ENCRYPTION_KEY must be a base64-encoded 32-byte key")
+	}
+	if cfg.AppEnv == "production" {
+		if cfg.GitHubClientID == "" {
+			problems = append(problems, "APP_ENV=production requires GITHUB_CLIENT_ID")
+		}
+		if cfg.GitHubClientSecret == "" {
+			problems = append(problems, "APP_ENV=production requires GITHUB_CLIENT_SECRET")
+		}
+	}
+	if cfg.BuildMode != "host-docker" && cfg.BuildMode != "disabled" {
+		problems = append(problems, fmt.Sprintf("BUILD_MODE must be host-docker or disabled, got %q", cfg.BuildMode))
+	}
+	if cfg.BuildCPUQuota <= 0 {
+		problems = append(problems, "BUILD_CPU_QUOTA must be greater than 0")
+	}
+	if cfg.BuildMemoryMB < 256 {
+		problems = append(problems, "BUILD_MEMORY_MB must be at least 256")
+	}
+	if cfg.DiskMinFreeGB < 0 {
+		problems = append(problems, "DISK_MIN_FREE_GB cannot be negative")
+	}
+	if cfg.ImagePruneHours < 1 {
+		problems = append(problems, "IMAGE_PRUNE_HOURS must be at least 1")
 	}
 	// Abuse-control bounds: a zero or negative limit would either lock every
 	// user out (0) or disable the control entirely, so refuse to boot.
 	if cfg.MaxActiveSandboxesPerUser < 1 || cfg.MaxActiveSandboxesPerUser > 100 {
-		return nil, fmt.Errorf("config: MAX_ACTIVE_SANDBOXES_PER_USER must be between 1 and 100, got %d", cfg.MaxActiveSandboxesPerUser)
+		problems = append(problems, fmt.Sprintf("MAX_ACTIVE_SANDBOXES_PER_USER must be between 1 and 100, got %d", cfg.MaxActiveSandboxesPerUser))
 	}
 	if cfg.MaxRunningSandboxes < 1 || cfg.MaxRunningSandboxes > 1000 {
-		return nil, fmt.Errorf("config: MAX_RUNNING_SANDBOXES must be between 1 and 1000, got %d", cfg.MaxRunningSandboxes)
+		problems = append(problems, fmt.Sprintf("MAX_RUNNING_SANDBOXES must be between 1 and 1000, got %d", cfg.MaxRunningSandboxes))
 	}
 	if cfg.BuildConcurrency < 1 || cfg.BuildConcurrency > 100 {
-		return nil, fmt.Errorf("config: BUILD_CONCURRENCY must be between 1 and 100, got %d", cfg.BuildConcurrency)
+		problems = append(problems, fmt.Sprintf("BUILD_CONCURRENCY must be between 1 and 100, got %d", cfg.BuildConcurrency))
+	}
+	if len(problems) > 0 {
+		return nil, fmt.Errorf("config: invalid configuration:\n  - %s\n(see .env.production.example)", strings.Join(problems, "\n  - "))
 	}
 	return cfg, nil
 }
@@ -189,6 +241,18 @@ func envIntDefault(key string, fallback int) int {
 		return fallback
 	}
 	n, err := strconv.Atoi(v)
+	if err != nil {
+		return fallback
+	}
+	return n
+}
+
+func envFloatDefault(key string, fallback float64) float64 {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.ParseFloat(v, 64)
 	if err != nil {
 		return fallback
 	}

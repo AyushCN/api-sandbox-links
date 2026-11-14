@@ -16,6 +16,7 @@ import (
 	"github.com/api-sandbox-links/backend/internal/analyze"
 	"github.com/api-sandbox-links/backend/internal/db"
 	"github.com/api-sandbox-links/backend/internal/git"
+	"github.com/api-sandbox-links/backend/internal/health"
 	"github.com/api-sandbox-links/backend/internal/orchestrator"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -110,6 +111,14 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	branch := req.Branch
 	if branch == "" {
 		branch = info.DefaultBranch
+	}
+
+	if disk := health.Disk(s.cfg); !disk.OK {
+		writeJSON(w, http.StatusInsufficientStorage, map[string]any{
+			"error":  "insufficient_storage",
+			"detail": disk.Detail,
+		})
+		return
 	}
 
 	// Preflight is authoritative: it runs before quota is consumed or a row is

@@ -20,16 +20,69 @@ import (
 	"github.com/api-sandbox-links/backend/internal/cache"
 	"github.com/api-sandbox-links/backend/internal/config"
 	"github.com/api-sandbox-links/backend/internal/db"
+	"github.com/api-sandbox-links/backend/internal/health"
 	"github.com/api-sandbox-links/backend/internal/orchestrator"
 	"github.com/api-sandbox-links/backend/internal/reaper"
 	"github.com/api-sandbox-links/backend/internal/secret"
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "doctor" {
+		os.Exit(doctor())
+	}
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// doctor prints a pass/fail checklist for every external dependency and exits
+// non-zero if any required check fails. It is deliberately usable before the
+// server ever starts.
+func doctor() int {
+	fmt.Println("API Sandbox doctor")
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Println(color(false, "FAIL") + " config: " + err.Error())
+		return 1
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	checks := []health.Check{
+		health.Postgres(ctx, cfg.DatabaseURL),
+		health.Redis(ctx, cfg.RedisURL),
+		health.Docker(ctx, cfg),
+	}
+	checks = append(checks, health.StaticChecks(ctx, cfg)...)
+
+	failed := false
+	for _, c := range checks {
+		if !c.OK {
+			failed = true
+		}
+		fmt.Printf("%s %-16s %s\n", color(c.OK, map[bool]string{true: "PASS", false: "FAIL"}[c.OK]), c.Name, c.Detail)
+	}
+	fmt.Printf("\nbuild mode: %s (explicit, unisolated host Docker is the supported production path)\n", cfg.BuildMode)
+	if failed {
+		return 1
+	}
+	return 0
+}
+
+func color(ok bool, s string) string {
+	if os.Getenv("NO_COLOR") != "" || !isTerminal(os.Stdout) {
+		return s
+	}
+	if ok {
+		return "\x1b[32m" + s + "\x1b[0m"
+	}
+	return "\x1b[31m" + s + "\x1b[0m"
+}
+
+func isTerminal(f *os.File) bool {
+	info, err := f.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
 
 // apiAddr binds the control-plane API to loopback only. Sandbox containers can
@@ -43,12 +96,29 @@ func gatewayAddr(port int) string { return fmt.Sprintf(":%d", port) }
 
 // run contains the full bootstrap. Splitting it from main keeps main readable
 // and makes the whole boot sequence testable.
+func ctxOrBackground() context.Context { return context.Background() }
+
 func run() error {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	cfg, err := config.Load()
 	if err != nil {
 		return err
+	}
+	logger.Info("configuration loaded",
+		slog.String("app_env", cfg.AppEnv),
+		slog.String("build_mode", cfg.BuildMode),
+		slog.Bool("dev_auth", cfg.DevAuth))
+	if cfg.BuildMode == "host-docker" {
+		logger.Warn("builds run on the host Docker daemon without isolation; this mode is explicit and supported")
+	}
+	if v, err := health.NixpacksVersion(ctxOrBackground(), cfg); err != nil {
+		logger.Warn("nixpacks is unavailable", slog.String("err", err.Error()))
+	} else {
+		logger.Info("nixpacks detected", slog.String("version", v))
+	}
+	if disk := health.Disk(cfg); !disk.OK {
+		logger.Warn("low disk space", slog.String("detail", disk.Detail))
 	}
 
 	// Root context cancelled by SIGINT/SIGTERM; every worker is cancellable via it.
@@ -109,6 +179,7 @@ func run() error {
 	go reaper.NewExpiryReaper(store, orch, cfg, logger, 60*time.Second).Run(ctx)
 	go reaper.NewSnapshotReaper(store, logger, reaper.SnapshotSweepInterval, reaper.SnapshotRetention).Run(ctx)
 	go orchestrator.NewStatsFlushWorker(store, redis, logger, orchestrator.StatsFlushInterval).Run(ctx)
+	go orch.RunHygiene(ctx, time.Hour)
 
 	// --- HTTP surfaces ---------------------------------------------------
 	server := api.New(cfg, store, redis, orch, deployer, box, aiClient, logger)

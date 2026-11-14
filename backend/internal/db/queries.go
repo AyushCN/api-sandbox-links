@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -561,4 +562,13 @@ func (s *Store) DeleteEnvVarsNotIn(sandboxID string, keep []string) (int64, erro
 		return 0, fmt.Errorf("db: deleting stale env vars for %s: %w", sandboxID, res.Error)
 	}
 	return res.RowsAffected, nil
+}
+
+// Ping verifies Postgres is reachable; used by readiness and the doctor.
+func (s *Store) Ping(ctx context.Context) error {
+	sqlDB, err := s.db.DB()
+	if err != nil {
+		return err
+	}
+	return sqlDB.PingContext(ctx)
 }
