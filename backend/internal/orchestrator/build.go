@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -42,21 +43,41 @@ type planPayload struct {
 // tool configuration, which the same-UID nixpacks process could read directly
 // anyway. This reduces accidental inheritance but is not isolation.
 func nixpacksEnv(home string) []string {
+	return nixpacksEnvWith(home, nil)
+}
+
+// nixpacksEnvWith adds explicit, non-secret build settings chosen from the
+// preflight result. Only these NIXPACKS_* keys are ever forwarded; arbitrary
+// NIXPACKS_* values from the parent (which may contain private registry
+// credentials) stay excluded.
+func nixpacksEnvWith(home string, extra map[string]string) []string {
 	allowed := map[string]bool{
 		"PATH": true, "USER": true, "LOGNAME": true,
 		"LANG": true, "LC_ALL": true, "LC_CTYPE": true, "TZ": true,
 		"TMPDIR": true, "TMP": true, "TEMP": true,
 		"NIXPACKS_NODE_VERSION": true, "NIXPACKS_PYTHON_VERSION": true,
 		"NIXPACKS_GO_VERSION": true, "NIXPACKS_RUST_VERSION": true,
-		"NIXPACKS_JAVA_VERSION": true,
+		"NIXPACKS_JAVA_VERSION": true, "NIXPACKS_START_CMD": true,
+		"NIXPACKS_MAVEN_ARGS": true,
 	}
 	env := os.Environ()
-	out := make([]string, 0, len(env)+1)
+	out := make([]string, 0, len(env)+len(extra)+1)
+	seen := map[string]bool{}
 	for _, kv := range env {
 		key, _, ok := strings.Cut(kv, "=")
 		if ok && allowed[key] {
+			if _, override := extra[key]; override {
+				continue
+			}
 			out = append(out, kv)
+			seen[key] = true
 		}
+	}
+	for k, v := range extra {
+		if v == "" || seen[k] {
+			continue
+		}
+		out = append(out, k+"="+v)
 	}
 	return append(out, "HOME="+home)
 }
@@ -123,12 +144,66 @@ func (o *Orchestrator) PlanAnalyze(ctx context.Context, dir string) (*BuildPlan,
 	return bp, nil
 }
 
-// BuildImage runs `nixpacks build` for the directory and returns the image tag
-// it produced. Output goes to the provided writer (usually the deployment log
-// collector so the user can watch build progress).
-func (o *Orchestrator) BuildImage(ctx context.Context, dir, name string, progress *bytes.Buffer) (string, error) {
+// BuildOptions carries the preflight decisions that must influence the image.
+type BuildOptions struct {
+	StartCommand    string
+	Language        string
+	Framework       string
+	LanguageVersion string
+	Builder         string
+}
+
+// BuildImage runs the appropriate builder for the directory and returns the
+// image tag it produced. A Dockerfile (case-insensitive, repository root) wins
+// over nixpacks; this priority is deliberate and documented in docs/SETUP.md:
+// a repository that ships a Dockerfile has already made its build/run decisions
+// and the platform should honour them.
+func (o *Orchestrator) BuildImage(ctx context.Context, dir, name string, progress *bytes.Buffer, opts ...BuildOptions) (string, error) {
+	var opt BuildOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+	if dockerfile := findDockerfile(dir); dockerfile != "" {
+		args := []string{"build", "-t", name + ":latest", "-f", dockerfile, dir}
+		cmd := exec.Command("docker", args...)
+		cmd.Env = dockerEnv(o.cfg.DockerHost)
+		if progress != nil {
+			cmd.Stdout = progress
+			cmd.Stderr = progress
+		}
+		if err := runProcessGroup(ctx, cmd); err != nil {
+			return "", fmt.Errorf("orchestrator: docker build failed: %w", err)
+		}
+		return name + ":latest", nil
+	}
+
+	extra := map[string]string{}
+	if opt.StartCommand != "" {
+		extra["NIXPACKS_START_CMD"] = opt.StartCommand
+	}
+	switch opt.Language {
+	case "go":
+		if opt.LanguageVersion != "" {
+			extra["NIXPACKS_GO_VERSION"] = opt.LanguageVersion
+		}
+	case "node":
+		if opt.LanguageVersion != "" {
+			extra["NIXPACKS_NODE_VERSION"] = opt.LanguageVersion
+		}
+	case "python":
+		if opt.LanguageVersion != "" {
+			extra["NIXPACKS_PYTHON_VERSION"] = opt.LanguageVersion
+		}
+	case "java":
+		if opt.LanguageVersion != "" {
+			extra["NIXPACKS_JAVA_VERSION"] = opt.LanguageVersion
+		}
+		// Integration projects are slow to test; the deploy flow builds the
+		// app, it does not run the repository's test suite.
+		extra["NIXPACKS_MAVEN_ARGS"] = "-DskipTests"
+	}
 	cmd := exec.Command(o.cfg.NixpacksBin, "build", "--name", name, dir)
-	cmd.Env = nixpacksEnv(os.Getenv("HOME"))
+	cmd.Env = nixpacksEnvWith(os.Getenv("HOME"), extra)
 	if progress != nil {
 		cmd.Stdout = progress
 		cmd.Stderr = progress
@@ -138,6 +213,36 @@ func (o *Orchestrator) BuildImage(ctx context.Context, dir, name string, progres
 		return "", fmt.Errorf("orchestrator: nixpacks build failed: %w", err)
 	}
 	return name + ":latest", nil
+}
+
+func findDockerfile(dir string) string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.EqualFold(e.Name(), "Dockerfile") {
+			return filepath.Join(dir, e.Name())
+		}
+	}
+	return ""
+}
+
+// dockerEnv keeps platform secrets out of the Docker CLI while retaining the
+// daemon endpoint and the user's Docker config.
+func dockerEnv(host string) []string {
+	allowed := map[string]bool{"PATH": true, "HOME": true, "USER": true, "LOGNAME": true, "DOCKER_CONFIG": true}
+	var out []string
+	for _, kv := range os.Environ() {
+		key, _, ok := strings.Cut(kv, "=")
+		if ok && allowed[key] {
+			out = append(out, kv)
+		}
+	}
+	if host != "" {
+		out = append(out, "DOCKER_HOST="+host)
+	}
+	return out
 }
 
 // detectPort resolves the internal port for a sandbox container. Preference

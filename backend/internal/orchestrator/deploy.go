@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/api-sandbox-links/backend/internal/analyze"
 	"github.com/api-sandbox-links/backend/internal/cache"
 	"github.com/api-sandbox-links/backend/internal/config"
 	"github.com/api-sandbox-links/backend/internal/db"
@@ -82,6 +83,12 @@ type DeployOptions struct {
 	// DatabaseOverride forces a sidecar engine ("postgres"/"mysql"/"none") or
 	// leaves "auto" to repository detection.
 	DatabaseOverride string
+	// StartCommand is the reviewed user/analysis choice. Empty falls back to
+	// the value stored on the sandbox row.
+	StartCommand string
+	// Services is the reviewed service selection. Nil falls back to manifest
+	// detection.
+	Services *analyze.Services
 }
 
 // DeploySandbox deploys (or redeploys) the given sandbox and records progress
@@ -198,7 +205,7 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 
 	// Phase H: sidecar database. Detection reads the freshly-cloned files; an
 	// explicit override wins over auto-detection.
-	if err := d.maybeProvisionDatabase(ctx, sandbox, opts.DatabaseOverride, workDir); err != nil {
+	if err := d.maybeProvisionDatabase(ctx, sandbox, opts, workDir); err != nil {
 		return markFailed(fmt.Errorf("deploy: provisioning sidecar database: %w", err))
 	}
 	// Starting the app before its database accepts connections makes the first
@@ -214,7 +221,20 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 	}
 	port := plan.InternalPort
 
-	imageTag, err := d.orch.BuildImage(ctx, workDir, "sandbox-"+sandbox.Subdomain, buildLog)
+	startCommand := strings.TrimSpace(opts.StartCommand)
+	if startCommand == "" {
+		startCommand = strings.TrimSpace(sandbox.StartCommand)
+	}
+	if startCommand == "" {
+		startCommand = strings.TrimSpace(plan.StartCmd)
+	}
+	project := analyze.DetectProject(workDir)
+	imageTag, err := d.orch.BuildImage(ctx, workDir, "sandbox-"+sandbox.Subdomain, buildLog, BuildOptions{
+		StartCommand:    startCommand,
+		Language:        project.Language,
+		Framework:       project.Framework,
+		LanguageVersion: project.Version,
+	})
 	if err != nil {
 		return markFailed(err, buildLog.String())
 	}
@@ -317,7 +337,7 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 	buildMeta, _ := json.Marshal(map[string]any{
 		"provider": plan.Provider,
 		"port":     plan.InternalPort,
-		"start":    plan.StartCmd,
+		"start":    startCommand,
 	})
 	_ = d.store.UpdateSandbox(sandbox.ID, map[string]any{"build_config": string(buildMeta)})
 
@@ -327,8 +347,18 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 // maybeProvisionDatabase starts a sidecar DB for the sandbox when the repo
 // needs one (or the user insists via override). Auto-detection reads the
 // cloned working directory; an explicit "none" opts out.
-func (d *Deployer) maybeProvisionDatabase(ctx context.Context, sandbox *db.Sandbox, override, workDir string) error {
-	engine := strings.TrimSpace(override)
+func (d *Deployer) maybeProvisionDatabase(ctx context.Context, sandbox *db.Sandbox, opts DeployOptions, workDir string) error {
+	engine := strings.TrimSpace(opts.DatabaseOverride)
+	if opts.Services != nil && (engine == "" || engine == "auto") {
+		switch {
+		case opts.Services.Postgres:
+			engine = "postgres"
+		case opts.Services.MySQL:
+			engine = "mysql"
+		default:
+			engine = "none"
+		}
+	}
 	if engine == "" || engine == "auto" {
 		detected, needed := DetectDatabaseNeed(workDir)
 		if !needed {

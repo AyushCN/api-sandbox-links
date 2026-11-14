@@ -2,11 +2,13 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/api-sandbox-links/backend/internal/db"
@@ -181,9 +183,47 @@ func (s *Server) handleRecreateSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	name := parent.Subdomain
-	if info, err := git.ParseGitHubURL(repo.GithubURL); err == nil {
-		name = info.Name
+	info, err := git.ParseGitHubURL(repo.GithubURL)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not read the repository URL")
+		return
 	}
+	name = info.Name
+	result, err := s.analyzer.Analyze(r.Context(), info.CloneURL, parent.BranchName)
+	if err != nil {
+		status, msg := friendlyAnalyzeError(err)
+		writeErr(w, status, msg)
+		return
+	}
+	if len(result.Blockers) > 0 {
+		writeBlockers(w, result.Blockers)
+		return
+	}
+	svc, err := servicesFromJSON(json.RawMessage(parent.ServicesOverride), "", result.Services)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid services selection on the parent sandbox")
+		return
+	}
+	plainEnv, err := s.plainEnv(parent.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not read the previous sandbox settings")
+		return
+	}
+	mergedEnv, missing, problems := prepareEnv(plainEnv, result, svc)
+	if len(problems) > 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_env", "problems": problems})
+		return
+	}
+	if len(missing) > 0 {
+		writeMissingEnv(w, missing)
+		return
+	}
+	startCommand := parent.StartCommand
+	if startCommand == "" {
+		startCommand = result.StartCommand
+	}
+	servicesBytes, _ := json.Marshal(svc)
+
 	subdomain, err := s.uniqueSubdomain(name)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "could not allocate subdomain")
@@ -204,6 +244,8 @@ func (s *Server) handleRecreateSandbox(w http.ResponseWriter, r *http.Request) {
 		IdleTimeoutSeconds: idleTimeout,
 		LifetimeSeconds:    lifetime,
 		ExpiresAt:          now.Add(time.Duration(lifetime) * time.Second),
+		StartCommand:       strings.TrimSpace(startCommand),
+		ServicesOverride:   servicesBytes,
 		CreatedAt:          now,
 	}
 	if err := s.store.CreateSandboxWithinLimits(child, user.ID, s.maxActiveSandboxes(), s.maxRunningSandboxes()); err != nil {
@@ -220,18 +262,11 @@ func (s *Server) handleRecreateSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Copy the parent's env vars; the encrypted values can be copied directly
-	// without decrypting them here.
-	if vars, err := s.store.ListEnvVars(parent.ID); err != nil {
-		s.logger.Warn("recreate: loading env vars",
-			slog.String("parent", parent.ID), slog.String("err", err.Error()))
-	} else {
-		for _, v := range vars {
-			if err := s.store.UpsertEnvVar(child.ID, v.Key, v.Value, v.IsAISuggested); err != nil {
-				s.logger.Warn("recreate: copying env var",
-					slog.String("sandbox", child.ID), slog.String("key", v.Key), slog.String("err", err.Error()))
-			}
-		}
+	if err := s.replaceEnv(child.ID, mergedEnv); err != nil {
+		s.logger.Warn("recreate: copying env vars",
+			slog.String("sandbox", child.ID), slog.String("err", err.Error()))
+		writeErr(w, http.StatusInternalServerError, "sandbox was recreated but its settings could not be copied")
+		return
 	}
 
 	go func() {
@@ -240,6 +275,8 @@ func (s *Server) handleRecreateSandbox(w http.ResponseWriter, r *http.Request) {
 		if err := s.deployer.DeploySandbox(ctx, child, orchestrator.DeployOptions{
 			Trigger:          db.TriggerRecreate,
 			DatabaseOverride: "auto",
+			StartCommand:     child.StartCommand,
+			Services:         &svc,
 		}); err != nil {
 			s.logger.Warn("recreate deploy failed",
 				slog.String("sandbox", child.ID), slog.String("err", err.Error()))
@@ -260,7 +297,50 @@ func (s *Server) handleRedeploy(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "destroyed sandboxes cannot be redeployed; recreate instead")
 		return
 	}
-	opts := orchestrator.DeployOptions{Trigger: db.TriggerManual}
+	repo, err := s.store.GetRepository(sb.RepositoryID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not load the repository")
+		return
+	}
+	info, err := git.ParseGitHubURL(repo.GithubURL)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not read the repository URL")
+		return
+	}
+	result, err := s.analyzer.Analyze(r.Context(), info.CloneURL, sb.BranchName)
+	if err != nil {
+		status, msg := friendlyAnalyzeError(err)
+		writeErr(w, status, msg)
+		return
+	}
+	if len(result.Blockers) > 0 {
+		writeBlockers(w, result.Blockers)
+		return
+	}
+	svc, err := servicesFromJSON(json.RawMessage(sb.ServicesOverride), "", result.Services)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid services selection")
+		return
+	}
+	plainEnv, err := s.plainEnv(sb.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not read the sandbox settings")
+		return
+	}
+	_, missing, problems := prepareEnv(plainEnv, result, svc)
+	if len(problems) > 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_env", "problems": problems})
+		return
+	}
+	if len(missing) > 0 {
+		writeMissingEnv(w, missing)
+		return
+	}
+	startCommand := sb.StartCommand
+	if startCommand == "" {
+		startCommand = result.StartCommand
+	}
+	opts := orchestrator.DeployOptions{Trigger: db.TriggerManual, StartCommand: startCommand, Services: &svc}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), orchestrator.DeployTimeout)
 		defer cancel()

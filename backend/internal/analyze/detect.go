@@ -506,3 +506,16 @@ func parsePort(s string) int {
 	}
 	return n
 }
+
+// Project is the exported, read-only view of Detect used by the deployer.
+type Project struct {
+	Language  string
+	Framework string
+	Version   string
+}
+
+// DetectProject is Detect for callers outside this package.
+func DetectProject(dir string) Project {
+	info := Detect(dir)
+	return Project{Language: info.language, Framework: info.framework, Version: info.version}
+}

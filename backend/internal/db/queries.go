@@ -547,3 +547,18 @@ func (s *Store) MarkFileEditsPushed(sandboxID string) error {
 		Where("sandbox_id = ? AND pushed_to_github = ?", sandboxID, false).
 		Update("pushed_to_github", true).Error
 }
+
+// DeleteEnvVarsNotIn removes env vars whose keys are not in keep. PUT
+// /api/sandboxes/{id}/env replaces the whole set, and stale keys must not
+// linger in the container environment.
+func (s *Store) DeleteEnvVarsNotIn(sandboxID string, keep []string) (int64, error) {
+	q := s.db.Where("sandbox_id = ?", sandboxID)
+	if len(keep) > 0 {
+		q = q.Where("key NOT IN ?", keep)
+	}
+	res := q.Delete(&EnvVar{})
+	if res.Error != nil {
+		return 0, fmt.Errorf("db: deleting stale env vars for %s: %w", sandboxID, res.Error)
+	}
+	return res.RowsAffected, nil
+}

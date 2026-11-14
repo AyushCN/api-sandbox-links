@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/api-sandbox-links/backend/internal/ai"
+	"github.com/api-sandbox-links/backend/internal/analyze"
 	"github.com/api-sandbox-links/backend/internal/cache"
 	"github.com/api-sandbox-links/backend/internal/config"
 	"github.com/api-sandbox-links/backend/internal/db"
@@ -37,6 +38,8 @@ type Server struct {
 	ai       *ai.Client
 	logger   *slog.Logger
 	gateway  *proxy.Gateway
+	analyzer *analyze.Analyzer
+	ratelim  *repoRateLimiter
 }
 
 // New assembles the Server with its ready-to-use dependencies.
@@ -60,6 +63,8 @@ func New(
 		ai:       aiClient,
 		logger:   logger,
 		gateway:  proxy.NewGateway(store, cache, orch, cfg, logger),
+		analyzer: analyze.New(cfg.NixpacksBin),
+		ratelim:  newRepoRateLimiter(10, time.Minute),
 	}
 }
 
@@ -98,11 +103,13 @@ func (s *Server) Router() http.Handler {
 	r.Group(func(protected chi.Router) {
 		protected.Use(s.requireUser)
 		protected.Get("/api/me", s.handleMe)
+		protected.Post("/api/repos/analyze", s.handleAnalyzeRepo)
 
 		protected.Route("/api/sandboxes", func(pr chi.Router) {
 			pr.Get("/", s.handleListSandboxes)
 			pr.Post("/", s.handleCreateSandbox)
 			pr.Get("/{id}", s.handleGetSandbox)
+			pr.Put("/{id}/env", s.handleUpdateEnv)
 			pr.Post("/{id}/actions/extend", s.handleExtendLifetime)
 			pr.Post("/{id}/actions/destroy", s.handleDestroySandbox)
 			pr.Post("/{id}/actions/recreate", s.handleRecreateSandbox)

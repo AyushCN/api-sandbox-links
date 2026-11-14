@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -9,8 +10,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/api-sandbox-links/backend/internal/analyze"
 	"github.com/api-sandbox-links/backend/internal/db"
 	"github.com/api-sandbox-links/backend/internal/git"
 	"github.com/api-sandbox-links/backend/internal/orchestrator"
@@ -55,6 +58,52 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 		childLifetime = s.maxLifetime()
 	}
 
+	repo, err := s.store.GetRepository(parent.RepositoryID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not load the parent repository")
+		return
+	}
+	info, err := git.ParseGitHubURL(repo.GithubURL)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not read the parent repository URL")
+		return
+	}
+	result, err := s.analyzer.Analyze(r.Context(), info.CloneURL, parent.BranchName)
+	if err != nil {
+		status, msg := friendlyAnalyzeError(err)
+		writeErr(w, status, msg)
+		return
+	}
+	if len(result.Blockers) > 0 {
+		writeBlockers(w, result.Blockers)
+		return
+	}
+	svc, err := servicesFromJSON(json.RawMessage(parent.ServicesOverride), "", result.Services)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid services selection on the parent sandbox")
+		return
+	}
+	plain, err := s.plainEnv(parent.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not read the parent sandbox settings")
+		return
+	}
+	mergedEnv, missing, problems := prepareEnv(plain, result, svc)
+	if len(problems) > 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_env", "problems": problems})
+		return
+	}
+	if len(missing) > 0 {
+		writeMissingEnv(w, missing)
+		return
+	}
+	_ = mergedEnv
+	startCommand := parent.StartCommand
+	if startCommand == "" {
+		startCommand = result.StartCommand
+	}
+	servicesBytes, _ := json.Marshal(svc)
+
 	subdomain, err := s.uniqueSubdomain("fork-" + parent.Subdomain)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "could not allocate subdomain")
@@ -72,6 +121,8 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 		IdleTimeoutSeconds: parent.IdleTimeoutSeconds,
 		LifetimeSeconds:    childLifetime,
 		ExpiresAt:          now.Add(time.Duration(childLifetime) * time.Second),
+		StartCommand:       strings.TrimSpace(startCommand),
+		ServicesOverride:   servicesBytes,
 		CreatedAt:          now,
 	}
 	if err := s.store.CreateSandboxWithinLimits(child, user.ID, s.maxActiveSandboxes(), s.maxRunningSandboxes()); err != nil {
@@ -85,6 +136,12 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 		}
 		s.logger.Warn("fork: creating child sandbox", slog.String("parent", parent.ID), slog.String("err", err.Error()))
 		writeErr(w, http.StatusInternalServerError, "could not create fork")
+		return
+	}
+
+	if err := s.replaceEnv(child.ID, mergedEnv); err != nil {
+		s.logger.Warn("fork: copying env vars", slog.String("sandbox", child.ID), slog.String("err", err.Error()))
+		writeErr(w, http.StatusInternalServerError, "fork was created but its settings could not be copied")
 		return
 	}
 
@@ -131,7 +188,12 @@ func (s *Server) forkDeploy(parentCtx context.Context, parent, child *db.Sandbox
 
 	// 3. Deploy the child like any other sandbox; the DB container's IP waits
 	// are handled inside DeploySandbox (it only needs the DATABASE_URL env).
-	if err := s.deployer.DeploySandbox(ctx, child, orchestrator.DeployOptions{Trigger: db.TriggerFork}); err != nil {
+	svc, _ := servicesFromJSON(json.RawMessage(child.ServicesOverride), "", analyze.Services{})
+	if err := s.deployer.DeploySandbox(ctx, child, orchestrator.DeployOptions{
+		Trigger:      db.TriggerFork,
+		StartCommand: child.StartCommand,
+		Services:     &svc,
+	}); err != nil {
 		s.forkFailed(parentCtx, child, err)
 		return
 	}

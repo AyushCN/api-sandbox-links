@@ -61,9 +61,9 @@ const (
 
 // User is a GitHub-authenticated account.
 type User struct {
-	ID          string    `gorm:"type:uuid;primaryKey"`
-	GithubID    int64     `gorm:"uniqueIndex;not null"`
-	Username    string    `gorm:"not null"`
+	ID          string `gorm:"type:uuid;primaryKey"`
+	GithubID    int64  `gorm:"uniqueIndex;not null"`
+	Username    string `gorm:"not null"`
 	Email       string
 	AvatarURL   string
 	GithubToken []byte    `gorm:"not null"` // AES-GCM encrypted at rest
@@ -85,20 +85,20 @@ func (Repository) TableName() string { return "repositories" }
 // Sandbox is the core entity: one running backend instance with its own
 // lifetime and idle-timeout controls.
 type Sandbox struct {
-	ID                 string         `gorm:"type:uuid;primaryKey"`
-	RepositoryID       string         `gorm:"type:uuid;not null"`
-	ParentSandboxID    *string        `gorm:"type:uuid"`
-	BranchName         string         `gorm:"not null"`
-	Subdomain          string         `gorm:"uniqueIndex;not null"`
-	Status             SandboxStatus  `gorm:"not null;default:queued"`
+	ID                 string        `gorm:"type:uuid;primaryKey"`
+	RepositoryID       string        `gorm:"type:uuid;not null"`
+	ParentSandboxID    *string       `gorm:"type:uuid"`
+	BranchName         string        `gorm:"not null"`
+	Subdomain          string        `gorm:"uniqueIndex;not null"`
+	Status             SandboxStatus `gorm:"not null;default:queued"`
 	ContainerID        string
 	ImageTag           string
 	InternalPort       int
-	IdleTimeoutSeconds int            `gorm:"not null;default:900"`
+	IdleTimeoutSeconds int `gorm:"not null;default:900"`
 	LastRequestAt      *time.Time
 
-	LifetimeSeconds   int64     `gorm:"not null;default:86400"`
-	ExpiresAt         time.Time `gorm:"not null"`
+	LifetimeSeconds int64     `gorm:"not null;default:86400"`
+	ExpiresAt       time.Time `gorm:"not null"`
 	// ActivatedAt is when the sandbox first reached running, and is the instant
 	// the lifetime clock starts from. It stays nil until then, which is what
 	// tells a first activation apart from a redeploy.
@@ -106,7 +106,11 @@ type Sandbox struct {
 	DestroyedAt       *time.Time
 	DestructionReason string
 
-	DetectedLanguage string         `gorm:"type:text"`
+	DetectedLanguage string `gorm:"type:text"`
+	// StartCommand and ServicesOverride are the choices made at creation (or
+	// by the latest env edit) and are reused by every redeploy and fork.
+	StartCommand     string         `gorm:"type:text"`
+	ServicesOverride datatypes.JSON `gorm:"type:jsonb"`
 	BuildConfig      datatypes.JSON `gorm:"type:jsonb"`
 	AISuggestedEnv   datatypes.JSON `gorm:"type:jsonb"`
 	CreatedAt        time.Time      `gorm:"default:now()"`
@@ -143,9 +147,9 @@ func (EnvVar) TableName() string { return "sandbox_env_vars" }
 // SandboxDatabase is a sidecar DB container (per-sandbox, on the sandbox's
 // private Docker network).
 type SandboxDatabase struct {
-	ID            string    `gorm:"type:uuid;primaryKey"`
-	SandboxID     string    `gorm:"type:uuid;not null"`
-	Engine        string    `gorm:"not null"` // postgres | mysql | sqlite
+	ID            string `gorm:"type:uuid;primaryKey"`
+	SandboxID     string `gorm:"type:uuid;not null"`
+	Engine        string `gorm:"not null"` // postgres | mysql | sqlite
 	ContainerID   string
 	ConnectionURL []byte    `gorm:"not null"` // encrypted
 	ForkedFrom    *string   `gorm:"type:uuid"`

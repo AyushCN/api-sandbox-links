@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/api-sandbox-links/backend/internal/analyze"
 	"github.com/api-sandbox-links/backend/internal/db"
 	"github.com/api-sandbox-links/backend/internal/git"
 	"github.com/api-sandbox-links/backend/internal/orchestrator"
@@ -39,6 +40,10 @@ type createSandboxRequest struct {
 	IdleTimeoutSeconds int               `json:"idle_timeout_seconds"`
 	Database           string            `json:"database"` // auto | postgres | mysql | none
 	EnvVars            map[string]string `json:"env_vars"`
+	// StartCommand and Services carry the user's review-step choices. When
+	// omitted the analysis result is used unchanged.
+	StartCommand string           `json:"start_command"`
+	Services     *serviceOverride `json:"services"`
 }
 
 // handleListSandboxes returns the signed-in user's sandboxes, newest first.
@@ -107,6 +112,38 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		branch = info.DefaultBranch
 	}
 
+	// Preflight is authoritative: it runs before quota is consumed or a row is
+	// inserted, so a missing setting or a known-bad toolchain never starts a
+	// build that is doomed to fail twenty seconds later.
+	analysisCtx, cancel := context.WithTimeout(r.Context(), analyze.CloneTimeout+analyze.PlanTimeout+10*time.Second)
+	result, err := s.analyzer.Analyze(analysisCtx, info.CloneURL, branch)
+	cancel()
+	if err != nil {
+		status, msg := friendlyAnalyzeError(err)
+		s.logger.Warn("create preflight failed", slog.String("repo", info.CloneURL), slog.String("err", err.Error()))
+		writeErr(w, status, msg)
+		return
+	}
+	if len(result.Blockers) > 0 {
+		writeBlockers(w, result.Blockers)
+		return
+	}
+	svc := effectiveServices(req.Services, req.Database, result.Services)
+	mergedEnv, missing, problems := prepareEnv(req.EnvVars, result, svc)
+	if len(problems) > 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_env", "problems": problems})
+		return
+	}
+	if len(missing) > 0 {
+		writeMissingEnv(w, missing)
+		return
+	}
+	startCommand := strings.TrimSpace(req.StartCommand)
+	if startCommand == "" {
+		startCommand = result.StartCommand
+	}
+	servicesJSONBytes, _ := json.Marshal(svc)
+
 	repo, err := s.store.FindOrCreateRepository(user.ID, info.CloneURL, info.DefaultBranch)
 	if err != nil {
 		s.logger.Warn("repository lookup failed", slog.String("err", err.Error()))
@@ -130,6 +167,8 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		IdleTimeoutSeconds: idleTimeout,
 		LifetimeSeconds:    lifetime,
 		ExpiresAt:          now.Add(time.Duration(lifetime) * time.Second),
+		StartCommand:       startCommand,
+		ServicesOverride:   servicesJSONBytes,
 		CreatedAt:          now,
 	}
 	if err := s.store.CreateSandboxWithinLimits(sandbox, user.ID, s.maxActiveSandboxes(), s.maxRunningSandboxes()); err != nil {
@@ -146,17 +185,21 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Persist any user-supplied env vars (encrypted immediately).
-	for key, value := range req.EnvVars {
-		enc, err := s.box.Encrypt([]byte(value))
-		if err != nil {
-			continue
-		}
-		_ = s.store.UpsertEnvVar(sandbox.ID, key, enc, false)
+	// Persist the validated values encrypted. The gate above already ensured
+	// every required setting is present.
+	if err := s.replaceEnv(sandbox.ID, mergedEnv); err != nil {
+		s.logger.Warn("create: storing env vars", slog.String("sandbox", sandbox.ID), slog.String("err", err.Error()))
+		writeErr(w, http.StatusInternalServerError, "Sandbox was created but its settings could not be saved. Destroy it and try again.")
+		return
 	}
 
 	// Deploy asynchronously; the client polls the sandbox until running.
-	opts := orchestrator.DeployOptions{Trigger: db.TriggerInitial, DatabaseOverride: req.Database}
+	opts := orchestrator.DeployOptions{
+		Trigger:          db.TriggerInitial,
+		DatabaseOverride: req.Database,
+		StartCommand:     startCommand,
+		Services:         &svc,
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), orchestrator.DeployTimeout)
 		defer cancel()
@@ -249,6 +292,9 @@ func (s *Server) sandboxJSON(sb *db.Sandbox) map[string]any {
 		"destroyed_at":       sb.DestroyedAt,
 		"destruction_reason": sb.DestructionReason,
 		"detected_language":  sb.DetectedLanguage,
+		"start_command":      sb.StartCommand,
+		"services":           json.RawMessage(sb.ServicesOverride),
+		"env_vars":           s.envKeysJSON(sb.ID),
 		"build_config":       sb.BuildConfig,
 		"created_at":         sb.CreatedAt,
 		"updated_at":         sb.UpdatedAt,
