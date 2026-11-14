@@ -134,18 +134,38 @@ func run() error {
 		slog.String("gateway", gatewaySrv.Addr),
 		slog.Bool("dev_auth", cfg.DevAuth))
 
+	var serverErr error
 	select {
 	case <-ctx.Done():
 		logger.Info("shutting down")
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return fmt.Errorf("http server: %w", err)
+			logger.Error("server error, shutting down", slog.String("err", err.Error()))
+			serverErr = fmt.Errorf("http server: %w", err)
 		}
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Graceful shutdown with explicit phase budgets under a global timeout
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	_ = apiSrv.Shutdown(shutdownCtx)
-	_ = gatewaySrv.Shutdown(shutdownCtx)
-	return nil
+
+	// Phase 1: Drain in-flight API requests (budget: up to 5s)
+	apiShutdownCtx, apiCancel := context.WithTimeout(shutdownCtx, 5*time.Second)
+	if err := apiSrv.Shutdown(apiShutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		logger.Warn("api server shutdown error", slog.String("err", err.Error()))
+	}
+	apiCancel()
+
+	// Phase 2: Close gateway listener (budget: up to 2s)
+	gwShutdownCtx, gwCancel := context.WithTimeout(shutdownCtx, 2*time.Second)
+	if err := gatewaySrv.Shutdown(gwShutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		logger.Warn("gateway server shutdown error", slog.String("err", err.Error()))
+	}
+	gwCancel()
+
+	// Phase 3: Cancel and wait for background operations (budget: remaining global time)
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		logger.Warn("background tasks shutdown error", slog.String("err", err.Error()))
+	}
+	return serverErr
 }

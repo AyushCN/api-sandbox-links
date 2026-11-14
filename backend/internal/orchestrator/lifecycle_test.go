@@ -29,6 +29,22 @@ func TestSandboxHostConfigIsolationDefaults(t *testing.T) {
 	if len(hc.CapDrop) == 0 || hc.CapDrop[0] != "ALL" {
 		t.Errorf("expected CapDrop ALL, got %v", hc.CapDrop)
 	}
+	if len(hc.Binds) != 0 {
+		t.Errorf("expected no host binds (workspace unmounted), got %v", hc.Binds)
+	}
+}
+
+// TestRuntimeWritesPreventedHostWorkspaceNotMounted verifies that the container's
+// host configuration never mounts the host workspace directory, ensuring that a
+// running app container cannot write to or mutate the host workspace during a fork.
+func TestRuntimeWritesPreventedHostWorkspaceNotMounted(t *testing.T) {
+	cfg := &config.Config{
+		SandboxWorkDir: "/tmp/api-sandbox-links/work",
+	}
+	hc := sandboxHostConfig(cfg)
+	if len(hc.Binds) != 0 {
+		t.Fatalf("CRITICAL: host workspace directory is bind-mounted into container: %v", hc.Binds)
+	}
 }
 
 func TestSandboxHostConfigHardened(t *testing.T) {
@@ -81,4 +97,3 @@ func TestSidecarHostConfigDefaults(t *testing.T) {
 		t.Errorf("expected bind vol_my:/var/lib/mysql, got %v", hcMySQL.Binds)
 	}
 }
-

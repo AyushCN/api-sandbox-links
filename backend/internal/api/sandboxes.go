@@ -199,8 +199,10 @@ func (s *Server) authorizeSandboxAccess(r *http.Request) (*db.Sandbox, error) {
 	id := chi.URLParam(r, "id")
 	owns, err := s.store.OwnsSandbox(id, user.ID)
 	if err != nil {
-		s.logger.Warn("sandbox access check failed",
-			slog.String("sandbox", id), slog.String("err", err.Error()))
+		if s.logger != nil {
+			s.logger.Warn("sandbox access check failed",
+				slog.String("sandbox", id), slog.String("err", err.Error()))
+		}
 		return nil, errSandboxForbidden
 	}
 	if !owns {

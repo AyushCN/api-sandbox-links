@@ -19,6 +19,7 @@ import (
 
 	"github.com/api-sandbox-links/backend/internal/db"
 	"github.com/api-sandbox-links/backend/internal/orchestrator"
+	"github.com/api-sandbox-links/backend/internal/workspacelock"
 )
 
 // fileEntry is the shape of one node in the file tree.
@@ -220,22 +221,22 @@ func (s *Server) handleSaveFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "sandbox is destroyed; nothing to edit")
 		return
 	}
-	if _, forking := forkLocks.Load(sb.ID); forking {
-		writeErr(w, http.StatusConflict, "sandbox is currently being forked; please retry")
-		return
-	}
+
 	var req saveFileRequest
 	if err := decodeJSON(r, &req); err != nil || req.Path == "" {
 		writeErr(w, http.StatusBadRequest, "path is required")
 		return
 	}
 
-	rootHandle, err := s.sandboxRoot(sb.ID)
+	cleanPath, err := validateRelativePath(req.Path)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "working directory not found (sandbox may still be building)")
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	defer rootHandle.Close()
+	if isGitPath(cleanPath) {
+		writeErr(w, http.StatusBadRequest, "git internals are not editable")
+		return
+	}
 
 	var data []byte
 	if req.IsBase64 {
@@ -248,6 +249,28 @@ func (s *Server) handleSaveFile(w http.ResponseWriter, r *http.Request) {
 		data = []byte(req.Content)
 	}
 
+	saveLock, err := s.locks().AcquireSave(r.Context(), sb.ID)
+	if err != nil {
+		if errors.Is(err, workspacelock.ErrForkActive) {
+			writeErr(w, http.StatusConflict, "sandbox is currently being forked; please retry")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "could not acquire workspace lock")
+		return
+	}
+	defer saveLock.Release()
+
+	if s.forkHooks != nil && s.forkHooks.onBeforeSaveWrite != nil {
+		s.forkHooks.onBeforeSaveWrite(sb.ID)
+	}
+
+	rootHandle, err := s.sandboxRoot(sb.ID)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "working directory not found (sandbox may still be building)")
+		return
+	}
+	defer rootHandle.Close()
+
 	if err := saveFileContent(rootHandle, req.Path, data); err != nil {
 		var hErr httpErr
 		if errors.As(err, &hErr) {
@@ -258,21 +281,33 @@ func (s *Server) handleSaveFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cleanPath, _ := validateRelativePath(req.Path)
-	_ = s.store.RecordFileEdit(sb.ID, cleanPath, user.ID)
+	if s.store != nil {
+		_ = s.store.RecordFileEdit(sb.ID, cleanPath, user.ID)
+	}
+
+	// Release workspace lock: disk writes and audit logging are complete.
+	// Releasing the write lock before spawning the background redeploy ensures
+	// the background build never races with an in-progress write or deadlocks
+	// against a lock held by the launching HTTP request.
+	saveLock.Release()
 
 	// Trigger the redeploy in the background, deduped so rapid-fire saves don't
 	// start three rebuilds at once.
-	_, already := redeployLocks.LoadOrStore(sb.ID, struct{}{})
-	if !already {
-		go func() {
-			defer redeployLocks.Delete(sb.ID)
-			ctx, cancel := context.WithTimeout(context.Background(), orchestrator.DeployTimeout)
-			defer cancel()
-			if err := s.deployer.DeploySandbox(ctx, sb, orchestrator.DeployOptions{Trigger: db.TriggerSaveRedeploy}); err != nil {
-				s.logger.Warn("save redeploy failed", slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
+	if s.deployer != nil {
+		_, already := redeployLocks.LoadOrStore(sb.ID, struct{}{})
+		if !already {
+			started := s.goBackground(func(ctx context.Context) {
+				defer redeployLocks.Delete(sb.ID)
+				if err := s.deployer.DeploySandbox(ctx, sb, orchestrator.DeployOptions{Trigger: db.TriggerSaveRedeploy}); err != nil {
+					if s.logger != nil {
+						s.logger.Warn("save redeploy failed", slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
+					}
+				}
+			})
+			if !started {
+				redeployLocks.Delete(sb.ID)
 			}
-		}()
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"saved": true, "path": cleanPath, "redeploying": true})

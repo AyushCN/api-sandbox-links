@@ -9,6 +9,7 @@ import (
 
 	"github.com/api-sandbox-links/backend/internal/db"
 	"github.com/api-sandbox-links/backend/internal/git"
+	"github.com/api-sandbox-links/backend/internal/workspacelock"
 )
 
 // commitPushRequest is the body of POST /{id}/commit.
@@ -51,17 +52,6 @@ func (s *Server) handleCommitPush(w http.ResponseWriter, r *http.Request) {
 		message = "Sandbox edits from API Sandbox Links"
 	}
 
-	workDir := filepath.Join(s.cfg.SandboxWorkDir, sb.Subdomain)
-	hash, err := git.CommitAll(r.Context(), workDir, message)
-	if err != nil {
-		if errors.Is(err, git.ErrNoChanges) {
-			writeErr(w, http.StatusConflict, "nothing to commit (no changes in the sandbox working directory)")
-			return
-		}
-		writeErr(w, http.StatusInternalServerError, "could not commit: "+err.Error())
-		return
-	}
-
 	targetBranch := req.Branch
 	if targetBranch == "" {
 		targetBranch = "sandbox-edits-" + sb.Subdomain
@@ -73,6 +63,28 @@ func (s *Server) handleCommitPush(w http.ResponseWriter, r *http.Request) {
 	token, err := s.decryptUserToken(user.ID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "could not read GitHub credentials")
+		return
+	}
+
+	saveLock, err := s.locks().AcquireCommit(r.Context(), sb.ID)
+	if err != nil {
+		if errors.Is(err, workspacelock.ErrForkActive) {
+			writeErr(w, http.StatusConflict, "sandbox is currently being forked; please retry")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "could not acquire workspace lock")
+		return
+	}
+	defer saveLock.Release()
+
+	workDir := filepath.Join(s.cfg.SandboxWorkDir, sb.Subdomain)
+	hash, err := git.CommitAll(r.Context(), workDir, message)
+	if err != nil {
+		if errors.Is(err, git.ErrNoChanges) {
+			writeErr(w, http.StatusConflict, "nothing to commit (no changes in the sandbox working directory)")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "could not commit: "+err.Error())
 		return
 	}
 

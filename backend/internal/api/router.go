@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"runtime/debug"
+	"sync"
 	"time"
 
 	"github.com/api-sandbox-links/backend/internal/ai"
@@ -14,6 +16,7 @@ import (
 	"github.com/api-sandbox-links/backend/internal/orchestrator"
 	"github.com/api-sandbox-links/backend/internal/proxy"
 	"github.com/api-sandbox-links/backend/internal/secret"
+	"github.com/api-sandbox-links/backend/internal/workspacelock"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 )
@@ -21,15 +24,103 @@ import (
 // Server bundles every dependency the HTTP layer needs. It is constructed
 // once in main and shared by all handlers.
 type Server struct {
-	cfg      *config.Config
-	store    *db.Store
-	cache    *cache.Redis
-	orch     *orchestrator.Orchestrator
-	deployer *orchestrator.Deployer
-	box      *secret.Box
-	ai       *ai.Client
-	logger   *slog.Logger
-	gateway  *proxy.Gateway
+	cfg            *config.Config
+	store          Store
+	cache          *cache.Redis
+	orch           *orchestrator.Orchestrator
+	deployer       *orchestrator.Deployer
+	box            *secret.Box
+	ai             *ai.Client
+	logger         *slog.Logger
+	gateway        *proxy.Gateway
+	workspaceLocks *workspacelock.Manager
+
+	// Background lifecycle management
+	bgCtx    context.Context
+	bgCancel context.CancelFunc
+	bgWg     sync.WaitGroup
+	bgMu     sync.RWMutex
+	bgClosed bool
+
+	// Synchronization hooks for deterministic testing (nil in production)
+	forkHooks *forkHooks
+}
+
+type forkHooks struct {
+	onBeforeForkCopy  func(parentID string)
+	onAfterForkCopy   func(parentID string)
+	onBeforeSaveWrite func(sandboxID string)
+}
+
+func (s *Server) baseContext() context.Context {
+	if s.bgCtx != nil {
+		return s.bgCtx
+	}
+	return context.Background()
+}
+
+// goBackground registers a background task with the Server's wait group,
+// derives a context from the server base context with orchestrator.DeployTimeout,
+// and ensures the task is tracked across graceful shutdown.
+// If the server has already started shutting down, goBackground rejects the task
+// and returns false without modifying the WaitGroup.
+func (s *Server) goBackground(fn func(ctx context.Context)) bool {
+	s.bgMu.RLock()
+	if s.bgClosed {
+		s.bgMu.RUnlock()
+		return false
+	}
+	s.bgWg.Add(1)
+	s.bgMu.RUnlock()
+
+	go func() {
+		defer s.bgWg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				if s.logger != nil {
+					s.logger.Error("background task panicked",
+						slog.Any("panic", r),
+						slog.String("stack", string(debug.Stack())),
+					)
+				}
+			}
+		}()
+		ctx, cancel := context.WithTimeout(s.baseContext(), orchestrator.DeployTimeout)
+		defer cancel()
+		fn(ctx)
+	}()
+	return true
+}
+
+// Shutdown signals all active background operations to cancel and waits for them
+// to complete or until the provided context expires.
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.bgMu.Lock()
+	s.bgClosed = true
+	if s.bgCancel != nil {
+		s.bgCancel()
+	}
+	s.bgMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		s.bgWg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Server) locks() *workspacelock.Manager {
+	if s.workspaceLocks == nil {
+		s.workspaceLocks = workspacelock.NewManager()
+	}
+	return s.workspaceLocks
 }
 
 // New assembles the Server with its ready-to-use dependencies.
@@ -43,16 +134,20 @@ func New(
 	aiClient *ai.Client,
 	logger *slog.Logger,
 ) *Server {
+	bgCtx, bgCancel := context.WithCancel(context.Background())
 	return &Server{
-		cfg:      cfg,
-		store:    store,
-		cache:    cache,
-		orch:     orch,
-		deployer: deployer,
-		box:      box,
-		ai:       aiClient,
-		logger:   logger,
-		gateway:  proxy.NewGateway(store, cache, orch, cfg, logger),
+		cfg:            cfg,
+		store:          store,
+		cache:          cache,
+		orch:           orch,
+		deployer:       deployer,
+		box:            box,
+		ai:             aiClient,
+		logger:         logger,
+		gateway:        proxy.NewGateway(store, cache, orch, cfg, logger),
+		workspaceLocks: workspacelock.NewManager(),
+		bgCtx:          bgCtx,
+		bgCancel:       bgCancel,
 	}
 }
 

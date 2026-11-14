@@ -8,17 +8,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/api-sandbox-links/backend/internal/db"
 	"github.com/api-sandbox-links/backend/internal/git"
 	"github.com/api-sandbox-links/backend/internal/orchestrator"
+	"github.com/api-sandbox-links/backend/internal/workspacelock"
 	"github.com/google/uuid"
 )
-
-// forkLocks prevents concurrent file mutations while a sandbox is being forked.
-var forkLocks sync.Map
 
 // handleForkSandbox creates a child sandbox that is an independent copy of the
 // parent: its own sandbox row (parent_sandbox_id set), a deep copy of the
@@ -41,11 +38,15 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "cannot fork a destroyed sandbox")
 		return
 	}
-	if _, already := forkLocks.LoadOrStore(parent.ID, struct{}{}); already {
-		writeErr(w, http.StatusConflict, "fork already in progress for this sandbox")
+	forkLock, err := s.locks().BeginFork(parent.ID)
+	if err != nil {
+		if errors.Is(err, workspacelock.ErrForkInProgress) {
+			writeErr(w, http.StatusConflict, "fork already in progress for this sandbox")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "could not acquire workspace lock")
 		return
 	}
-	defer forkLocks.Delete(parent.ID)
 
 	// Child lifetime = parent's remaining lifetime, clamped to [min, max].
 	//
@@ -63,10 +64,15 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 		childLifetime = s.maxLifetime()
 	}
 
-	subdomain, err := s.uniqueSubdomain("fork-" + parent.Subdomain)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not allocate subdomain")
-		return
+	subdomain := "fork-" + parent.Subdomain
+	if s.store != nil {
+		var err error
+		subdomain, err = s.uniqueSubdomain(subdomain)
+		if err != nil {
+			forkLock.Release()
+			writeErr(w, http.StatusInternalServerError, "could not allocate subdomain")
+			return
+		}
 	}
 
 	now := time.Now()
@@ -82,66 +88,107 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt:          now.Add(time.Duration(childLifetime) * time.Second),
 		CreatedAt:          now,
 	}
-	if err := s.store.CreateSandboxWithinLimits(child, user.ID, s.maxActiveSandboxes(), s.maxRunningSandboxes()); err != nil {
-		if errors.Is(err, db.ErrSandboxQuotaExceeded) {
-			s.writeSandboxQuotaExceeded(w)
+	if s.store != nil {
+		if err := s.store.CreateSandboxWithinLimits(child, user.ID, s.maxActiveSandboxes(), s.maxRunningSandboxes()); err != nil {
+			forkLock.Release()
+			if errors.Is(err, db.ErrSandboxQuotaExceeded) {
+				s.writeSandboxQuotaExceeded(w)
+				return
+			}
+			if errors.Is(err, db.ErrGlobalCapacityReached) {
+				s.writeGlobalCapacityExceeded(w)
+				return
+			}
+			if s.logger != nil {
+				s.logger.Warn("fork: creating child sandbox", slog.String("parent", parent.ID), slog.String("err", err.Error()))
+			}
+			writeErr(w, http.StatusInternalServerError, "could not create fork")
 			return
 		}
-		if errors.Is(err, db.ErrGlobalCapacityReached) {
-			s.writeGlobalCapacityExceeded(w)
-			return
-		}
-		s.logger.Warn("fork: creating child sandbox", slog.String("parent", parent.ID), slog.String("err", err.Error()))
-		writeErr(w, http.StatusInternalServerError, "could not create fork")
+	}
+
+	childJSON := s.sandboxJSON(child)
+
+	started := s.goBackground(func(ctx context.Context) {
+		s.forkDeploy(ctx, parent, child, forkLock)
+	})
+	if !started {
+		forkLock.Release()
+		s.forkFailed(child, errors.New("server is shutting down"))
+		writeErr(w, http.StatusServiceUnavailable, "server is shutting down")
 		return
 	}
 
-	go s.forkDeploy(r.Context(), parent, child)
-
-	writeJSON(w, http.StatusAccepted, s.sandboxJSON(child))
+	writeJSON(w, http.StatusAccepted, childJSON)
 }
 
 // forkDeploy prepares the child's working copy and sidecar DBs, then deploys.
-func (s *Server) forkDeploy(parentCtx context.Context, parent, child *db.Sandbox) {
-	ctx, cancel := context.WithTimeout(context.Background(), orchestrator.DeployTimeout)
-	defer cancel()
+func (s *Server) forkDeploy(ctx context.Context, parent, child *db.Sandbox, forkLock *workspacelock.ForkLock) {
+	defer forkLock.Release()
+	defer func() {
+		if r := recover(); r != nil {
+			s.forkFailed(child, fmt.Errorf("panic during fork deploy: %v", r))
+			panic(r)
+		}
+	}()
+
+	// Wait for any in-flight writers on parent to finish writing before taking the snapshot
+	if err := forkLock.WaitExclusive(ctx); err != nil {
+		s.forkFailed(child, fmt.Errorf("waiting for parent workspace lock: %w", err))
+		return
+	}
+
+	if s.forkHooks != nil && s.forkHooks.onBeforeForkCopy != nil {
+		s.forkHooks.onBeforeForkCopy(parent.ID)
+	}
 
 	// 1. Deep-copy the parent's working directory so current edits carry over.
 	parentDir := filepath.Join(s.cfg.SandboxWorkDir, parent.Subdomain)
 	childDir := filepath.Join(s.cfg.SandboxWorkDir, child.Subdomain)
 	if info, err := os.Stat(parentDir); err == nil && info.IsDir() {
 		if err := copyDir(parentDir, childDir); err != nil {
-			s.forkFailed(parentCtx, child, err)
+			s.forkFailed(child, err)
 			return
 		}
 	} else {
 		repo, err := s.store.GetRepository(parent.RepositoryID)
 		if err == nil {
 			if _, err := git.Clone(ctx, repo.GithubURL, child.BranchName, childDir); err != nil {
-				s.forkFailed(parentCtx, child, err)
+				s.forkFailed(child, err)
 				return
 			}
 		}
 	}
 
-	// 2. Deep-copy each parent sidecar database volume into a fresh child DB.
-	dbs, err := s.store.ListSandboxDatabases(parent.ID)
-	if err != nil {
-		s.forkFailed(parentCtx, child, err)
-		return
+	// The source snapshot is complete: release the parent workspace lock immediately
+	forkLock.Release()
+
+	if s.forkHooks != nil && s.forkHooks.onAfterForkCopy != nil {
+		s.forkHooks.onAfterForkCopy(parent.ID)
 	}
-	for _, pdb := range dbs {
-		if _, _, err := s.orch.ForkDatabase(ctx, pdb, child.ID); err != nil {
-			s.forkFailed(parentCtx, child, fmt.Errorf("forking database %s: %w", pdb.ID, err))
+
+	// 2. Deep-copy each parent sidecar database volume into a fresh child DB.
+	if s.store != nil && s.orch != nil {
+		dbs, err := s.store.ListSandboxDatabases(parent.ID)
+		if err != nil {
+			s.forkFailed(child, err)
 			return
+		}
+		for _, pdb := range dbs {
+			if _, _, err := s.orch.ForkDatabase(ctx, pdb, child.ID); err != nil {
+				s.forkFailed(child, fmt.Errorf("forking database %s: %w", pdb.ID, err))
+				return
+			}
 		}
 	}
 
 	// 3. Deploy the child like any other sandbox; the DB container's IP waits
 	// are handled inside DeploySandbox (it only needs the DATABASE_URL env).
-	if err := s.deployer.DeploySandbox(ctx, child, orchestrator.DeployOptions{Trigger: db.TriggerFork}); err != nil {
-		s.forkFailed(parentCtx, child, err)
-		return
+	if s.deployer != nil {
+		if err := s.deployer.DeploySandbox(ctx, child, orchestrator.DeployOptions{Trigger: db.TriggerFork}); err != nil {
+			s.forkFailed(child, err)
+			return
+		}
 	}
 }
 
@@ -150,18 +197,23 @@ func (s *Server) forkDeploy(parentCtx context.Context, parent, child *db.Sandbox
 // the parent, its volume, the private network, or a partially built image).
 // Only the child is touched: every lookup is keyed by the child's sandbox-id
 // label.
-func (s *Server) forkFailed(ctx context.Context, child *db.Sandbox, cause error) {
-	s.logger.Warn("fork deploy failed", slog.String("sandbox", child.ID), slog.String("err", cause.Error()))
+func (s *Server) forkFailed(child *db.Sandbox, cause error) {
+	if s.logger != nil {
+		s.logger.Warn("fork deploy failed", slog.String("sandbox", child.ID), slog.String("err", cause.Error()))
+	}
 	if s.orch != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		if err := s.orch.TeardownSandbox(cleanupCtx, child); err != nil {
-			s.logger.Warn("fork: tearing down failed fork",
-				slog.String("sandbox", child.ID), slog.String("err", err.Error()))
+			if s.logger != nil {
+				s.logger.Warn("fork: tearing down failed fork",
+					slog.String("sandbox", child.ID), slog.String("err", err.Error()))
+			}
 		}
 		cancel()
 	}
-	_ = s.store.UpdateSandbox(child.ID, map[string]any{
-		"status": string(db.StatusFailed),
-	})
-	_ = ctx
+	if s.store != nil {
+		_ = s.store.UpdateSandbox(child.ID, map[string]any{
+			"status": string(db.StatusFailed),
+		})
+	}
 }
