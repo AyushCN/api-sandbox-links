@@ -87,14 +87,18 @@ func build(host, ownerName string) (*RepoInfo, error) {
 // the resolved branch that was checked out (useful for the default-branch
 // fallback path in calls that did a HEAD clone).
 func Clone(ctx context.Context, cloneURL, branch, dir string) (string, error) {
-	ref := plumbing.NewBranchReferenceName(branch)
+	// An empty branch means "let the remote choose": go-git then checks out the
+	// repository's default branch, which is how /api/repos/analyze resolves the
+	// branch when the caller did not supply one.
 	opts := &git.CloneOptions{
-		URL:           cloneURL,
-		ReferenceName: ref,
-		SingleBranch:  true,
-		Depth:         1,
-		Auth:          nil,
-		Progress:      nil,
+		URL:          cloneURL,
+		SingleBranch: true,
+		Depth:        1,
+		Auth:         nil,
+		Progress:     nil,
+	}
+	if branch != "" {
+		opts.ReferenceName = plumbing.NewBranchReferenceName(branch)
 	}
 	repo, err := git.PlainCloneContext(ctx, dir, false, opts)
 	if err != nil {
