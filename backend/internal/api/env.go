@@ -212,7 +212,28 @@ func (s *Server) handleUpdateEnv(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "Invalid services selection.")
 		return
 	}
-	merged, missing, problems := prepareEnv(req.EnvVars, result, svc)
+	// The editor deliberately starts with blank inputs and the API never
+	// returns decrypted values. Treat a blank submission as "leave unchanged":
+	// otherwise opening the editor and pressing save would silently erase every
+	// secret the user did not retype.
+	existing, err := s.plainEnv(sb.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "Could not read the existing settings.")
+		return
+	}
+	provided := make(map[string]string, len(existing)+len(req.EnvVars))
+	for k, v := range existing {
+		provided[k] = v
+	}
+	for k, v := range req.EnvVars {
+		if strings.TrimSpace(v) == "" {
+			if _, ok := existing[k]; ok {
+				continue
+			}
+		}
+		provided[k] = v
+	}
+	merged, missing, problems := prepareEnv(provided, result, svc)
 	if len(problems) > 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_env", "problems": problems})
 		return

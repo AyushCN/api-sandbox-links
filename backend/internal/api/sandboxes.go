@@ -226,7 +226,11 @@ func (s *Server) handleGetSandbox(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, s.sandboxJSON(sb))
+	out := s.sandboxJSON(sb)
+	if repo, err := s.store.GetRepository(sb.RepositoryID); err == nil {
+		out["repo_url"] = repo.GithubURL
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // --- helpers -------------------------------------------------------------
