@@ -1,231 +1,202 @@
-# Setup (local dev)
+# Setup (Local Development)
 
-Verified environment: Linux, Go 1.26, Node 24, Docker 29 + Compose 2.x, nixpacks 1.x.
-The steps below target this box but transfer to any Linux/macOS dev machine.
+Verified environment: Linux (Ubuntu/Debian/Fedora), Go 1.25+, Node.js 20+, Docker Engine 28+ & Docker Compose v2.
+The steps below target Linux environments but transfer directly to macOS dev machines.
 
-`backend/go.mod` declares `go 1.26.0`, so a 1.25 toolchain still builds — Go's
-`GOTOOLCHAIN=auto` default fetches 1.26.0 on demand. The version that actually
-compiles the code is the one `go version` reports from `backend/`, not the one
-you started with.
+`backend/go.mod` targets Go 1.26 (compatible with Go 1.25+ toolchains). Go's standard `GOTOOLCHAIN=auto` automatically manages newer minor toolchains on demand.
 
-> There is **no Makefile** despite older references to `make bootstrap`/`make up` —
-> use the commands below directly. `go.mod` lives in `backend/`, so build from
-> `backend/`; the backend reads `.env` relative to its **working directory**, so
-> run the binary from the repo root.
+> [!NOTE]
+> There is **no Makefile** — use the commands below directly. Because `go.mod` lives in `backend/`, compile from `backend/`; the backend loads `.env` relative to its **current working directory**, so always execute the binary from the **repository root**.
+
+---
 
 ## 1. Prerequisites
 
-- Docker engine running (needed for builder image compilation and sandbox containers).
-- **Railpack (Default builder)**:
-  `curl -sSL https://railpack.com/install.sh | sh`, then confirm with `railpack --version`.
-  Point the backend at it via `RAILPACK_BIN` (defaults to `railpack` on PATH).
-  Requires BuildKit running on `BUILDKIT_HOST` (defaults to `tcp://127.0.0.1:1234`, provided by `docker-compose.dev.yml`).
-- **Nixpacks (Supported deprecated fallback)**:
-  `curl -sSL https://nixpacks.com/install.sh | bash`, then confirm with `nixpacks --version`.
-  Configure `BUILDER=nixpacks` in `.env` if needed during the deprecation transition. Point the backend at it via `NIXPACKS_BIN` (defaults to `nixpacks` on PATH).
-- Redis is provided by compose; the host's own `:6379`, if any, is never used.
+- **Docker Engine & Docker Compose v2**: Required for container orchestration, sidecar databases, and network isolation.
+- **Railpack (Default Builder Engine)**:
+  ```bash
+  curl -sSL https://railpack.com/install.sh | sh
+  railpack --version
+  ```
+  Point the backend at the binary via `RAILPACK_BIN` (defaults to `railpack` on `$PATH`).
+  Railpack requires a running BuildKit daemon configured via `BUILDKIT_HOST` (defaults to `tcp://127.0.0.1:1234`, provisioned automatically by `docker-compose.dev.yml`).
+- **Nixpacks (Supported Deprecated Fallback)**:
+  ```bash
+  curl -sSL https://nixpacks.com/install.sh | bash
+  nixpacks --version
+  ```
+  Set `BUILDER=nixpacks` in `.env` if needed during migration. Emits structured deprecation logs.
+- **Node.js 20+ & npm**: Required for running the Next.js 16 frontend console.
+- **Go 1.25+**: Required to compile the Go backend control plane.
 
-## 2. Environment — `.env`
+---
 
-Copy `.env.example` (the one at the **repo root**) to `.env` and fill it in:
+## 2. Environment Configuration — `.env`
+
+Copy `.env.example` from the repository root to `.env`:
 
 ```bash
 cp .env.example .env
 ```
 
-Required values (backend refuses to start without them):
+### Required Configuration Keys
 
-| Key | Value / note |
+The backend will refuse to start if any of these are missing:
+
+| Key | Value / Note |
 |---|---|
-| `DATABASE_URL` | `postgres://user:pass@localhost:5432/sandbox_platform` — matches `docker-compose.dev.yml` |
-| `REDIS_URL` | `redis://localhost:6380` |
-| `SECRETS_ENCRYPTION_KEY` | `openssl rand -base64 32`. Rotating it invalidates stored env vars and GitHub tokens |
+| `DATABASE_URL` | `postgres://user:pass@localhost:5434/sandbox_platform` (matches host port mapping in `docker-compose.dev.yml`) |
+| `REDIS_URL` | `redis://localhost:6380` (matches host port mapping in `docker-compose.dev.yml`) |
+| `SECRETS_ENCRYPTION_KEY` | Generate via `openssl rand -base64 32`. Rotating this key invalidates stored sandbox env vars and GitHub tokens. |
 
-Dev-auth mode vs real OAuth — leave `GITHUB_CLIENT_ID` empty for dev auth; the API
-auto-seeds a `devuser` and every `requireUser` request is auto-assigned it (no
-OAuth round-trip). Set real `GITHUB_CLIENT_ID`/`GITHUB_CLIENT_SECRET` to enable
-GitHub single sign-on and push-from-sandbox (section 5).
+### Authentication Modes: Dev Auth vs. GitHub OAuth
 
-The rest of the keys are optional overrides (`DOCKER_HOST`, `SANDBOX_WORK_DIR`,
-`BACKEND_PORT`, `GATEWAY_PORT`, `FRONTEND_URL`, `SANDBOX_BASE_DOMAIN`,
-`NIXPACKS_BIN`, `GEMINI_API_KEY`, `MAX_LIFETIME_SECONDS`). Defaults live in
-`backend/internal/config/config.go`.
+- **Dev Auth Mode (Default)**: Leave `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` empty in `.env`. The backend automatically seeds and authenticates requests as `devuser` (ID `1`), allowing full access to all sandboxes, terminals, and workspace features without an OAuth flow.
+- **GitHub OAuth Mode**: Set `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` to enable production GitHub SSO and push-to-branch capabilities from within sandboxes (see Section 6).
 
-## 3. Infrastructure — `docker-compose.dev.yml`
+### Optional Configuration Overrides
+
+Defaults are defined in [`backend/internal/config/config.go`](file:///home/swordrookie/projects/api_sandbox_links/api-sandbox-links/backend/internal/config/config.go):
+
+| Key | Default | Description |
+|---|---|---|
+| `BACKEND_PORT` | `8080` | Control plane REST and WebSocket port |
+| `GATEWAY_PORT` | `8090` | Single-flight wake-on-request proxy port |
+| `FRONTEND_URL` | `http://localhost:3000` | Allowed CORS origin and OAuth redirect target |
+| `SANDBOX_BASE_DOMAIN` | `sandbox.localhost` | Base domain for sandbox wildcards |
+| `BUILDKIT_HOST` | `tcp://127.0.0.1:1234` | BuildKit daemon TCP socket for Railpack builds |
+| `BUILDER` | `railpack` | Default builder engine (`railpack` or `nixpacks`) |
+| `SANDBOX_RUNTIME` | `""` | Set to `"runsc"` to enable Google gVisor kernel sandboxing |
+| `MAX_LIFETIME_SECONDS`| `604800` | Maximum lifetime cap (7 days) |
+
+---
+
+## 3. Infrastructure Services — `docker-compose.dev.yml`
+
+Spin up the supporting infrastructure:
 
 ```bash
 docker compose -f docker-compose.dev.yml up -d
 ```
 
-| Service | Host port | Notes |
-|---|---|---|
-| Postgres | `5432` | platform metadata (`user:pass`, db `sandbox_platform`) |
-| Redis | `6380` | hot state (idle TTL keys, newest live metric per sandbox) |
-| Traefik | `80`, `8081` | sandbox edge (`:80`), dashboard (`:8081`) |
-| BuildKit | `1234` | BuildKit daemon for Railpack builds (default builder) |
+### Dev Infrastructure Port Allocations
 
-Traefik runs with the Docker provider **disabled** and a file-provider wildcard
-router (`traefik/dynamic.yml`) that sends every `*.sandbox.localhost` host to the
-backend's gateway on the host at `:8090` (via `extra_hosts: host.docker.internal`).
-Dashboard: `http://127.0.0.1:8081/dashboard/`.
+| Service | Host Port | Internal Port | Purpose |
+|---|---|---|---|
+| **PostgreSQL** | `5434` | `5432` | Platform metadata, users, sandboxes, deployments (`user:pass`, DB `sandbox_platform`) |
+| **Redis** | `6380` | `6379` | Ephemeral hot state (idle TTL keys `lr:<id>`, live stats buffer) |
+| **Traefik Edge** | `80`, `8081` | `80`, `8080` | Wildcard reverse proxy (`:80`) and admin dashboard (`http://localhost:8081/dashboard/`) |
+| **BuildKit** | `1234` | `1234` | Rootless BuildKit daemon for high-performance layer-cached Railpack builds |
 
-## 4. Backend
+> [!IMPORTANT]
+> - Postgres host port is mapped to **`5434`** (not `5432`) to prevent collisions with existing PostgreSQL instances running on the host machine.
+> - Redis host port is mapped to **`6380`** (not `6379`) for the same reason.
+> - Traefik runs with the Docker socket provider **disabled**; routing is driven exclusively via the file provider ([`traefik/dynamic.yml`](file:///home/swordrookie/projects/api_sandbox_links/api-sandbox-links/traefik/dynamic.yml)), directing `*.sandbox.localhost` traffic to the backend gateway at `:8090`.
 
-Build from `backend/` (that is where `go.mod` lives):
+---
+
+## 4. Backend Service (Control Plane & Gateway)
+
+Build the Go backend from the `backend/` directory:
 
 ```bash
-cd api-sandbox-links/backend
+cd backend
 go build ./... && go vet ./...
-go test -race ./...     # see the note below
 go build -o server ./cmd/server
+cd ..
 ```
 
-The tests need no backend process, but four suites reach for real infrastructure
-and skip themselves when it is absent:
+### Running Backend Tests
 
-- `internal/orchestrator/logs_integration_test.go` and
-  `internal/orchestrator/teardown_test.go` drive a real **Docker** daemon,
-  starting throwaway containers to check the frame demux, the per-fd tail
-  backfill, and teardown against a real Postgres. Honour `ASL_TEST_IMAGE`
-  (default `node:20-alpine`) and `DOCKER_HOST`. Point it at a small local image
-  so it does not pull 800 MB.
-- `internal/api/websocket_e2e_test.go` opens **real HTTP + WebSocket** connections
-  against the real chi router — including `requireUser` with a genuinely sealed
-  session cookie, because a refused handshake is the failure that a
-  context-injecting test double cannot see. It needs both Docker and Postgres.
-- `internal/db/queries_test.go` and `internal/db/activation_test.go` need a real
-  **Postgres**, because the migrations, the `ON CONFLICT` clause, the
-  newest-N window and the activation upsert are not things a unit test can check.
-  Set `ASL_TEST_DATABASE_URL`:
-
-  ```bash
-  docker run -d --rm -p 55432:5432 -e POSTGRES_PASSWORD=pw postgres:16-alpine
-  ASL_TEST_DATABASE_URL='postgres://postgres:pw@localhost:55432/postgres?sslmode=disable' \
-    go test ./internal/db/ ./internal/api/ ./internal/orchestrator/
-  ```
-
-  All three packages share that one database and `go test` runs them in
-  parallel, so each fixture uses a **disjoint** `github_id` range (`internal/db`
-  `1–4` and `101–105`, `internal/orchestrator` `201–204`, `internal/api`
-  `301–306`). Register a cleanup with `t.Cleanup` **before** the first insert —
-  a fatal between two inserts otherwise leaves rows that fail the next run.
-
-Then run from the **repo root** (godotenv loads `./.env` from the CWD — running
-from `backend/` makes config fail):
+The test suites run without external dependencies by default, skipping suites that require live infrastructure unless configured:
 
 ```bash
-cd api-sandbox-links
-./backend/server &              # :8080 API + :8090 gateway
+# Run unit and race detector tests
+cd backend && go test -race ./...
 ```
 
-Health check — and run it before debugging anything in the UI:
+For integration testing against real Docker and Postgres:
+```bash
+docker run -d --rm -p 55432:5432 -e POSTGRES_PASSWORD=pw postgres:16-alpine
+ASL_TEST_DATABASE_URL='postgres://postgres:pw@localhost:55432/postgres?sslmode=disable' \
+  go test ./internal/db/ ./internal/api/ ./internal/orchestrator/
+```
 
+### Launching the Backend
+
+Always launch from the **repository root** so `godotenv` loads `./.env` correctly:
+
+```bash
+# From api-sandbox-links/ root:
+./backend/server
+```
+
+Verify backend health:
 ```bash
 curl http://localhost:8080/api/health
-# {"status":"ok","time":"…","dev_auth":true}
+# Expected output: {"status":"ok","time":"...","dev_auth":true}
 ```
 
-A curl that prints nothing and exits non-zero (`curl -o /dev/null -w '%{http_code}'`
-prints `000`) means **nothing is listening**, which is a different problem from a
-bug. The log panel cannot tell you this: a WebSocket to a dead port is reported
-by the browser as close code **1006**, exactly as a dropped connection would be,
-so the panel will sit there retrying with no log lines while the API is simply
-not running. Check the process and the ports before reading any code:
-
+Check active listening ports:
 ```bash
-ss -ltn | grep -E ':(8080|3000|8090)'   # both listeners + the frontend
-pgrep -af './backend/server'
-docker ps -a                            # exited containers are the usual culprit
+ss -ltn | grep -E ':(8080|8090|3000|5434|6380|1234)'
 ```
 
-To stop the backend, `kill $(pgrep -f './backend/server')` (never `pkill -f
-"./backend/server"` from a shell whose own command line matches the pattern).
+---
 
-## 5. Frontend
+## 5. Frontend Application (Next.js 16 Console)
+
+From the repository root, install and start the frontend:
 
 ```bash
 cd frontend
 npm install
-npm run dev      # http://localhost:3000
+npm run dev
 ```
 
-- `NEXT_PUBLIC_API_BASE` defaults to `http://localhost:8080`; override in
-  `frontend/.env.local` (that file's template is `frontend/.env.example`). An
-  empty or whitespace-only value is treated as unset, since the WebSocket panels
-  would otherwise build a relative URL the browser refuses to open.
-- The build gate is `npm run build` (Next 16 App Router, Tailwind v4).
-- Lint/typecheck: `npm run lint` and `npx tsc --noEmit`.
-- Frontend unit tests: `npm test` (Vitest, `npm run test:watch` to iterate).
-  The suites cover the pure helpers in `src/lib` — reconnect policy in
-  `ws.test.ts` and frame normalization in `frames.test.ts` — and need neither a
-  DOM nor a running backend. A component test will need `environment: "jsdom"`
-  plus `@vitejs/plugin-react` and `@testing-library/react`; see
-  `frontend/node_modules/next/dist/docs/01-app/02-guides/testing/vitest.md`.
-- `npx tsc --noEmit` needs the generated `frontend/.next/types` to exist. If it
-  fails with missing Next route types, run `npm run build` once first.
+Open **[http://localhost:3000](http://localhost:3000)** in your browser.
 
-## 6. GitHub OAuth (optional; skip to stay in dev auth)
+- API requests to `/api/*` are handled by Next.js BFF route handlers and proxied to the Go backend on `http://localhost:8080`.
+- Verify TypeScript types anytime with:
+  ```bash
+  npx tsc --noEmit
+  ```
+- Workspace projects and collaborator mappings are persisted locally at `/tmp/api-sandbox-links/projects.json`.
 
-1. Create an OAuth App at GitHub → Settings → Developer settings → OAuth Apps.
-2. Homepage URL: `http://localhost:3000`. Authorization callback URL must **byte
-   -for-byte match** `GITHUB_OAUTH_CALLBACK_URL` from `.env`
-   (`http://localhost:8080/api/auth/github/callback`) — no trailing slash, same
-   host/port. Mismatches surface as GitHub's `redirect_uri is not associated
-   with this application`.
-3. Set `GITHUB_CLIENT_ID`/`GITHUB_CLIENT_SECRET` in `.env`, restart the backend.
-4. Flow: `/api/auth/github` → GitHub consent → `/api/auth/github/callback` →
-   `asl_session` cookie set → redirect to `http://localhost:3000/dashboard?authed=1`.
-   Scopes requested: `read:user user:email repo`.
+---
 
-## 7. First end-to-end run
+## 6. GitHub OAuth Setup (Optional)
 
-1. Open the dashboard → paste `https://github.com/heroku/node-js-sample`
-   (branch `master`) → **Create**.
-2. Watch status go `queued → building → running` (first-ever nixpacks build can
-   take a couple of minutes; it installs the Nix provider).
-3. Open the **public URL** (`<subdomain>.sandbox.localhost` → `:80` → Traefik →
-   gateway `:8090` → container) — you should get the app's response.
-4. Wait out the idle TTL (or set `idle_timeout_seconds` low when creating), then
-   hit the URL again → observe wake-on-request flipping back to `running`.
-5. Use the editor tab to change a file → **Save & redeploy** → a `save_redeploy`
-   deployment fires; the **Git** tab can commit & push to a `sandbox-edits-*`
-   branch (push needs real OAuth).
+To enable GitHub sign-in and commit-pushing instead of local dev auth:
 
-## Troubleshooting
+1. Create a GitHub OAuth App at: **GitHub Settings → Developer Settings → OAuth Apps → New OAuth App**.
+2. **Homepage URL**: `http://localhost:3000`
+3. **Authorization Callback URL**: `http://localhost:8080/api/auth/github/callback` (must match `GITHUB_OAUTH_CALLBACK_URL` in `.env` byte-for-byte).
+4. Fill in `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` in `.env`.
+5. Restart `./backend/server`.
+6. Scopes requested: `read:user`, `user:email`, `repo`.
 
-- `config: DATABASE_URL and REDIS_URL are required` → you launched from the wrong
-  directory; start the binary from `api-sandbox-links/`.
-- Backend can't reach Postgres (`connection refused` on 5432) though the container
-  looks healthy → the port mapping silently dropped; fix with
-  `docker compose -f docker-compose.dev.yml up -d --force-recreate postgres`.
-- `relation "env_vars" does not exist` → a GORM table-name override is missing;
-  `EnvVar`/`LifetimeWarning` map to `sandbox_*` tables (see DATABASE.md).
-- Deployed link shows **"Sandbox container is not responding"** → the app
-  hardcodes a port the platform didn't predict. The deploy pipeline probes
-  listening ports and records the real one (see ARCHITECTURE.md); worktrees that
-  bind odd ports may need a redeploy after that fix lands.
-- `curl` to `localhost` silently going through an HTTP proxy → append
-  `--noproxy '*'`; Traefik logs may show host `-` (no router) for the same reason.
-- Docker provider router errors in the Traefik logs are **expected** (the provider
-  is disabled by design).
-- `/api/auth/github` returns 501 → OAuth config missing; either fill
-  `GITHUB_CLIENT_ID`/`SECRET` or use dev auth mode.
-- **Log panel shows `connection lost (code 1006)` in a loop and never prints a
-  line** → work outward, in this order, because all three look identical from the
-  panel:
-  1. `curl -o /dev/null -w '%{http_code}' http://localhost:8080/api/health`. `000`
-     means nothing is listening — start the backend. This is the most common
-     cause and the least obvious, because the code is the same one a dropped
-     connection produces.
-  2. No error log from `logs: dropping client that stopped reading` on the server
-     means the server never objected, so the socket likely never opened.
-  3. The panel now probes `GET /api/me` when a handshake fails and says
-     *"Your session has expired"* if the cookie is bad. If it does not appear,
-     the cookie is fine and the handshake was refused for another reason —
-     check `NEXT_PUBLIC_API_BASE` resolves to a host the browser considers
-     same-site as the frontend, or the session cookie is not attached to the
-     upgrade at all.
-- **Log panel is blank but the app is obviously running** → the sandbox row must
-  be `running` with a container id; only then do `log` frames arrive. A
-  `hibernated` sandbox sends `unavailable` with a reason. Check with
-  `GET /api/sandboxes/{id}` before suspecting the socket.
+---
+
+## 7. First End-to-End Sandbox Deployment
+
+1. Open **[http://localhost:3000/dashboard](http://localhost:3000/dashboard)**.
+2. Click **+ New Sandbox**.
+3. Enter repository: `https://github.com/heroku/node-js-sample` (branch `master`).
+4. Click **Create Sandbox**.
+5. Watch the lifecycle transition: `queued → building → running`.
+6. Open the public preview URL: `http://<subdomain>.sandbox.localhost:8090` (or through port `:80`).
+7. Open the in-browser IDE: edit files, click **Save & Redeploy**, and view live container stdout/stderr.
+
+---
+
+## 8. Troubleshooting & Common Pitfalls
+
+| Symptom | Root Cause | Solution |
+|---|---|---|
+| `config: DATABASE_URL and REDIS_URL are required` | Backend executed from `backend/` instead of repository root. | `cd ..` to repo root and run `./backend/server`. |
+| `connection refused on 5434` | Postgres container not running or ports mapped incorrectly. | Run `docker compose -f docker-compose.dev.yml up -d postgres`. |
+| `relation "env_vars" does not exist` | GORM table-name override omitted. | `EnvVar` maps to `sandbox_env_vars` (see [DATABASE.md](DATABASE.md)). |
+| `WebSocket connection lost (code 1006)` | Backend `:8080` process is not running, or cookie is expired. | Check `curl http://localhost:8080/api/health`. If backend is up, re-authenticate. |
+| Container shows "Port not responding" | Application binds a non-standard port not detected in plan. | Orchestrator probes common ports (`8080`, `3000`, `5000`, etc.) up to 90s. Ensure app listens on `0.0.0.0`. |
+| `Railpack build failed: dial tcp 127.0.0.1:1234` | BuildKit daemon container is stopped. | Verify BuildKit is running: `docker compose -f docker-compose.dev.yml up -d buildkit`. |

@@ -21,9 +21,11 @@ import {
   Share2,
   Globe,
   Radio,
+  Shield,
 } from "lucide-react";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { useTheme } from "@/lib/theme";
+import toast from "react-hot-toast";
 
 export default function LandingPage() {
   const { isDark } = useTheme();
@@ -32,6 +34,19 @@ export default function LandingPage() {
   >("backend");
 
   const [activeFeatureIndex, setActiveFeatureIndex] = useState(0);
+
+  const handleShare = async () => {
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard) {
+        await navigator.clipboard.writeText(window.location.origin);
+        toast.success("Platform link copied to clipboard!");
+      } else {
+        toast.success("API Sandbox: " + window.location.origin);
+      }
+    } catch {
+      toast.success("API Sandbox Platform");
+    }
+  };
 
   const teamUseCases = {
     backend: [
@@ -179,7 +194,7 @@ export default function LandingPage() {
 
             <nav className="hidden md:flex items-center gap-6 sm:gap-7 text-[11px] font-semibold uppercase tracking-wider text-white/75">
               <a
-                href="#features"
+                href="#builder-engine"
                 className="hover:text-white transition-colors duration-200"
               >
                 Engine
@@ -677,45 +692,61 @@ export default function LandingPage() {
 
             {/* Right: Feature Descriptions with Vertical Accent Line */}
             <div className="flex flex-col justify-center max-w-lg">
-              <h3 className="text-3xl sm:text-4xl font-extrabold tracking-tight text-[#1B1B1B] mb-10 leading-tight">
+              <h3 className={`text-3xl sm:text-4xl font-extrabold tracking-tight mb-10 leading-tight transition-colors ${isDark ? "text-white" : "text-[#1B1B1B]"}`}>
                 The intelligent foundation
                 <br />
                 for your backend.
               </h3>
 
-              <div className="relative pl-8 border-l-2 border-[#D9D7D0] space-y-10">
-                <div className="absolute left-[-2px] top-0 w-[2px] h-1/3 bg-gradient-to-b from-[#FF416C] to-[#FF4B2B]" />
+              <div className={`relative pl-8 border-l-2 space-y-9 transition-colors ${isDark ? "border-white/10" : "border-[#D9D7D0]"}`}>
+                <div className="absolute left-[-2px] top-0 w-[2px] h-1/4 bg-gradient-to-b from-[#FF416C] to-[#FF4B2B]" />
 
-                <div>
-                  <h4 className="text-lg font-bold text-[#1B1B1B] mb-2">
+                <div id="builder-engine" className="scroll-mt-32">
+                  <h4 className={`text-lg font-bold mb-2 transition-colors ${isDark ? "text-white" : "text-[#1B1B1B]"}`}>
                     Deterministic Builder Engine
                   </h4>
-                  <p className="text-sm text-[#8C8880] leading-relaxed">
+                  <p className={`text-sm leading-relaxed transition-colors ${isDark ? "text-neutral-400" : "text-[#8C8880]"}`}>
                     Prioritizes explicit user configuration, existing
                     Dockerfiles, and intelligent Railpack buildpack detection
                     without brittle guesswork.
                   </p>
                 </div>
 
-                <div>
-                  <h4 className="text-lg font-bold text-[#1B1B1B] mb-2">
+                <div id="sidecars" className="scroll-mt-32">
+                  <h4 className={`text-lg font-bold mb-2 transition-colors ${isDark ? "text-white" : "text-[#1B1B1B]"}`}>
                     Zero-Leak Sidecar Databases
                   </h4>
-                  <p className="text-sm text-[#8C8880] leading-relaxed">
+                  <p className={`text-sm leading-relaxed transition-colors ${isDark ? "text-neutral-400" : "text-[#8C8880]"}`}>
                     Automatically scans dependency descriptors and starts
                     isolated MySQL or PostgreSQL containers with volume
                     persistence and encrypted secrets.
                   </p>
                 </div>
 
-                <div>
-                  <h4 className="text-lg font-bold text-[#1B1B1B] mb-2">
-                    Idempotent Resource Teardown
+                <div id="gvisor-hardening" className="scroll-mt-32">
+                  <h4 className={`text-lg font-bold mb-2 transition-colors ${isDark ? "text-white" : "text-[#1B1B1B]"}`}>
+                    gVisor Kernel Hardening
                   </h4>
-                  <p className="text-sm text-[#8C8880] leading-relaxed">
-                    A reliable deletion contract that reclaims containers,
-                    sidecars, Docker networks, work directories, and Redis state
-                    cleanly without orphaned processes.
+                  <p className={`text-sm leading-relaxed transition-colors ${isDark ? "text-neutral-400" : "text-[#8C8880]"}`}>
+                    Multi-tenant process confinement powered by Google gVisor (<code className="font-mono text-xs px-1.5 py-0.5 rounded bg-black/5 dark:bg-white/10">runsc</code>). Virtualizes kernel syscalls with zero host kernel exposure.
+                  </p>
+                </div>
+
+                <div id="buildkit-cache" className="scroll-mt-32">
+                  <h4 className={`text-lg font-bold mb-2 transition-colors ${isDark ? "text-white" : "text-[#1B1B1B]"}`}>
+                    BuildKit Cache Pipeline
+                  </h4>
+                  <p className={`text-sm leading-relaxed transition-colors ${isDark ? "text-neutral-400" : "text-[#8C8880]"}`}>
+                    Distributed layer cache daemon over TCP. Reuses dependency build steps across container images to provide sub-second incremental sandbox rebuilds.
+                  </p>
+                </div>
+
+                <div id="idle-reaping" className="scroll-mt-32">
+                  <h4 className={`text-lg font-bold mb-2 transition-colors ${isDark ? "text-white" : "text-[#1B1B1B]"}`}>
+                    Automated Inactivity Reaping
+                  </h4>
+                  <p className={`text-sm leading-relaxed transition-colors ${isDark ? "text-neutral-400" : "text-[#8C8880]"}`}>
+                    Idempotent resource teardown that cleanly reclaims dormant containers, sidecars, networks, and ephemeral workspaces while keeping Git as your single source of truth.
                   </p>
                 </div>
               </div>
@@ -750,7 +781,7 @@ export default function LandingPage() {
               >
                 <div className="absolute left-[-2px] top-0 w-[2px] h-1/4 bg-gradient-to-b from-[#FF416C] to-[#FF4B2B]" />
 
-                <div>
+                <div id="ingress-gateway" className="scroll-mt-32">
                   <h4
                     className={`text-lg font-bold mb-1 transition-colors ${
                       isDark ? "text-white" : "text-[#1B1B1B]"
@@ -769,7 +800,7 @@ export default function LandingPage() {
                   </p>
                 </div>
 
-                <div>
+                <div id="telemetry" className="scroll-mt-32">
                   <h4
                     className={`text-lg font-bold mb-1 transition-colors ${
                       isDark ? "text-white" : "text-[#1B1B1B]"
@@ -1142,24 +1173,31 @@ export default function LandingPage() {
                 sandboxes.
               </p>
               <div className="flex gap-3">
-                <a
-                  href="#"
-                  className="w-9 h-9 rounded-full border border-white/10 flex items-center justify-center hover:bg-white/10 transition-colors text-white/70 hover:text-white"
+                <button
+                  type="button"
+                  onClick={handleShare}
+                  aria-label="Share platform"
+                  title="Share platform"
+                  className="w-9 h-9 rounded-full border border-white/10 flex items-center justify-center hover:bg-white/10 transition-colors text-white/70 hover:text-white cursor-pointer"
                 >
                   <Share2 className="w-4 h-4" />
-                </a>
-                <a
-                  href="#"
+                </button>
+                <Link
+                  href="/"
+                  aria-label="API Sandbox Home"
+                  title="Home"
                   className="w-9 h-9 rounded-full border border-white/10 flex items-center justify-center hover:bg-white/10 transition-colors text-white/70 hover:text-white"
                 >
                   <Globe className="w-4 h-4" />
-                </a>
-                <a
-                  href="#"
+                </Link>
+                <Link
+                  href="/dashboard"
+                  aria-label="Live Telemetry & Dashboard"
+                  title="Live Telemetry"
                   className="w-9 h-9 rounded-full border border-white/10 flex items-center justify-center hover:bg-white/10 transition-colors text-white/70 hover:text-white"
                 >
                   <Radio className="w-4 h-4" />
-                </a>
+                </Link>
               </div>
             </div>
 
@@ -1171,7 +1209,7 @@ export default function LandingPage() {
               <ul className="flex flex-col gap-3 text-xs text-white/60">
                 <li>
                   <a
-                    href="#features"
+                    href="#builder-engine"
                     className="hover:text-white transition-colors"
                   >
                     Builder Engine
@@ -1187,7 +1225,7 @@ export default function LandingPage() {
                 </li>
                 <li>
                   <a
-                    href="#architecture"
+                    href="#ingress-gateway"
                     className="hover:text-white transition-colors"
                   >
                     Ingress Gateway
@@ -1195,7 +1233,7 @@ export default function LandingPage() {
                 </li>
                 <li>
                   <a
-                    href="#features"
+                    href="#telemetry"
                     className="hover:text-white transition-colors"
                   >
                     WebSocket Telemetry
@@ -1210,24 +1248,24 @@ export default function LandingPage() {
               </h4>
               <ul className="flex flex-col gap-3 text-xs text-white/60">
                 <li>
-                  <a href="#" className="hover:text-white transition-colors">
+                  <a href="#gvisor-hardening" className="hover:text-white transition-colors">
                     gVisor Hardening
                   </a>
                 </li>
                 <li>
-                  <a href="#" className="hover:text-white transition-colors">
+                  <a href="#buildkit-cache" className="hover:text-white transition-colors">
                     BuildKit Cache
                   </a>
                 </li>
                 <li>
-                  <a href="#" className="hover:text-white transition-colors">
+                  <a href="#idle-reaping" className="hover:text-white transition-colors">
                     Idle Reaping
                   </a>
                 </li>
                 <li>
-                  <a href="#" className="hover:text-white transition-colors">
+                  <Link href="/terms#security" className="hover:text-white transition-colors">
                     Security Policy
-                  </a>
+                  </Link>
                 </li>
               </ul>
             </div>

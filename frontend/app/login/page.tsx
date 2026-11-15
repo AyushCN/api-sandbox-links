@@ -124,8 +124,19 @@ export default function LoginPage() {
       </main>
 
       {/* Footer */}
-      <footer className="w-full max-w-6xl mx-auto px-6 py-8 text-center text-[11px] text-neutral-400 z-10">
+      <footer className="w-full max-w-6xl mx-auto px-6 py-8 flex flex-col sm:flex-row items-center justify-between gap-4 text-[11px] text-neutral-500 dark:text-neutral-400 z-10 transition-colors">
         <p>© 2026 API Sandbox Links. All rights reserved.</p>
+        <div className="flex items-center gap-6">
+          <Link href="/" className="hover:text-black dark:hover:text-white transition-colors">
+            Home
+          </Link>
+          <Link href="/privacy" className="hover:text-black dark:hover:text-white transition-colors">
+            Privacy Policy
+          </Link>
+          <Link href="/terms" className="hover:text-black dark:hover:text-white transition-colors">
+            Terms of Service
+          </Link>
+        </div>
       </footer>
     </div>
   );

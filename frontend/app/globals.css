@@ -23,14 +23,14 @@
   --outline-variant: rgba(0, 0, 0, 0.08);
   --surface-variant: #EFEFEA;
 
-  --primary: #006970;
+  --primary: #E11D48;
   --on-primary: #FFFFFF;
-  --primary-container: #006970;
-  --on-primary-container: #FFFFFF;
-  --primary-fixed: #00676F;
+  --primary-container: #FFE4E6;
+  --on-primary-container: #9F1239;
+  --primary-fixed: #E11D48;
   --on-primary-fixed: #FFFFFF;
-  --primary-fixed-dim: #005057;
-  --on-primary-fixed-variant: #FFFFFF;
+  --primary-fixed-dim: #BE123C;
+  --on-primary-fixed-variant: #881337;
 
   --secondary: #4A5568;
   --on-secondary: #FFFFFF;
@@ -73,14 +73,14 @@
   --outline-variant: rgba(255, 255, 255, 0.08);
   --surface-variant: #26262D;
 
-  --primary: #DBFCFF;
-  --on-primary: #00363A;
-  --primary-container: #00F0FF;
-  --on-primary-container: #006970;
-  --primary-fixed: #7DF4FF;
-  --on-primary-fixed: #002022;
-  --primary-fixed-dim: #00DBE9;
-  --on-primary-fixed-variant: #004F54;
+  --primary: #FF5A79;
+  --on-primary: #FFFFFF;
+  --primary-container: rgba(255, 65, 108, 0.15);
+  --on-primary-container: #FFB3C0;
+  --primary-fixed: #FF4D6D;
+  --on-primary-fixed: #FFFFFF;
+  --primary-fixed-dim: #E03357;
+  --on-primary-fixed-variant: #FFCCD5;
 
   --secondary: #B7C8E1;
   --on-secondary: #213145;
@@ -190,9 +190,10 @@ body {
   font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
 }
 
-/* Custom scrollbar for cyber aesthetic */
+/* Subtle modern scrollbar */
 ::-webkit-scrollbar {
   width: 8px;
+  height: 8px;
 }
 ::-webkit-scrollbar-track {
   background: var(--surface-container-low);
@@ -202,7 +203,7 @@ body {
   border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--primary-fixed-dim);
+  background: var(--on-surface-variant);
 }
 
 /* Animations */

@@ -1,64 +1,153 @@
 # API Sandbox Links
 
-Turn any public GitHub repository into a **disposable, time-limited, fully-remotable sandbox** in a few seconds:
+[![Go Version](https://img.shields.io/badge/Go-1.25%2B-00ADD8?style=flat&logo=go)](https://golang.org)
+[![Next.js](https://img.shields.io/badge/Next.js-16.2-black?style=flat&logo=next.js)](https://nextjs.org)
+[![Docker](https://img.shields.io/badge/Docker-28%2B-2496ED?style=flat&logo=docker)](https://www.docker.com)
+[![Builder](https://img.shields.io/badge/Builder-Railpack%20%2B%20BuildKit-FF416C?style=flat)](https://railpack.com)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-- Paste a repo URL → the platform **clones** it, **builds** it with Nixpacks (auto-detected stack), and **runs** the app in an isolated container with **isolated networking** (`<subdomain>.localhost`).
-- Every sandbox gets a **public URL** (`https://`-style, works over `:80`) routed through Traefik → a gateway proxy that performs **wake-on-request** for hibernating sandboxes.
-- **Live logs** (xterm over WebSocket), **live CPU/memory metrics** (WebSocket + history chart), an in-browser **code editor** (Monaco) whose saves trigger a **save-redeploy**, and a one-click **commit & push** back to GitHub.
-- Sandboxes are **ephemeral**: a configurable lifetime (default 24h, max 7d) auto-destroys them; an **idle timeout** (default 15m) hibernates them; **fork** duplicates a live sandbox into a sibling container.
+> The operating system for modern ephemeral cloud environments. Turn any GitHub repository into an isolated, time-limited, live-previewable developer sandbox in seconds.
 
-> **Dev auth mode**: when `GITHUB_CLIENT_ID` is empty the backend auto-authenticates as a seeded `devuser`, so the whole system is testable without a GitHub OAuth app.
+---
 
-## Quick start
+## Highlights
 
-There's no Makefile — these are the exact commands (see `docs/SETUP.md`):
+* 🚀 **Deterministic Builder Engine**: Prioritizes native `Dockerfile` configurations, intelligent **Railpack** buildpack plans with **BuildKit** layer caching over TCP (`:1234`), and supported Nixpacks fallback.
+* 📦 **Zero-Leak Sidecar Databases**: Automatic dependency scanning detects database drivers (`pg`, `mysql2`, `psycopg2`, Prisma, GORM) and provisions isolated, pre-seeded PostgreSQL or MySQL containers on a shared bridge network.
+* ⚡ **Single-Flight Wake-on-Request**: Idle containers automatically hibernate after inactivity. Inbound HTTP gateway requests (`:8090`) trigger instantaneous single-flight container wakeups with live boot log streaming.
+* 👥 **Workspace Projects & Multi-Tenancy**: Organize sandboxes into microservice project groups. Manage collaborator roles (`OWNER`, `EDITOR`, `VIEWER`), assign repositories, and isolate environments without cross-project leakage.
+* 💻 **In-Browser IDE & Live Telemetry**: Live stdout/stderr logs over WebSockets, xterm terminal console, Monaco code editor with save-redeploy loops, and one-click Git commits pushed to remote branches.
+* 🛡️ **Container Hardening & gVisor Isolation**: Capability dropping (`CapDrop: ALL`), `no-new-privileges`, rootless BuildKit builds, and optional Google **gVisor** (`runsc`) user-space kernel virtualization.
+* 🎨 **Refined Ash & Coral Design System**: Clean, modern UI with theme-synchronized light/dark modes, custom ash grey terminals, and subtle contrast controls.
 
+---
+
+## Architecture at a Glance
+
+```
+                              Internet / Developer
+                                       │
+                                       ▼
+                     ┌───────────────────────────────────┐
+                     │   Traefik Edge Reverse Proxy      │  :80 / :443 (Wildcard *.sandbox.localhost)
+                     └─────────────────┬─────────────────┘
+                                       │
+                    ┌──────────────────┴──────────────────┐
+                    │ (Sandbox HTTP)                      │ (Console & Control Plane)
+                    ▼                                     ▼
+        ┌───────────────────────┐             ┌───────────────────────┐
+        │  Wake Gateway (:8090) │             │   API Server (:8080)  │  chi router, WebSockets
+        └───────────┬───────────┘             └───────────┬───────────┘
+                    │                                     │
+                    ▼                                     ├─▶ PostgreSQL (:5434 / state)
+        ┌───────────────────────┐                         ├─▶ Redis (:6380 / idle TTLs)
+        │ Live App Sandboxes    │                         ├─▶ BuildKit Daemon (:1234)
+        │ sandbox_<id>          │                         └─▶ Docker Daemon Socket
+        │ Sidecars (Postgres/DB)│
+        └───────────────────────┘
+```
+
+### Port Allocation Reference
+
+| Service | Port | Host Binding | Purpose |
+|---|---|---|---|
+| **Frontend Console** | `3000` | `127.0.0.1` | Next.js 16 App Router UI & Monaco IDE |
+| **API Control Plane** | `8080` | `127.0.0.1` | REST endpoints & live WebSocket telemetry |
+| **Gateway Proxy** | `8090` | `127.0.0.1` | Reverse proxy with single-flight wake-on-request |
+| **Edge Router (Traefik)** | `80`, `8081` | `0.0.0.0` | `*.sandbox.localhost` edge routing & Traefik dashboard (`:8081`) |
+| **PostgreSQL** | `5434` | `127.0.0.1` | Primary persistent state & audit logs (`user:pass`, db `sandbox_platform`) |
+| **Redis** | `6380` | `127.0.0.1` | Inactivity TTL markers (`lr:<id>`) & live metric caches |
+| **BuildKit Daemon** | `1234` | `127.0.0.1` | TCP build daemon for Railpack image builds |
+
+---
+
+## Quick Start (Local Development)
+
+### 1. Prerequisites
+- **Docker Engine** & **Docker Compose v2** installed and running.
+- **Go 1.25+** (tested against Go 1.25 / 1.26).
+- **Node.js 20+** (LTS or Node 24).
+- **Railpack CLI** (optional for host builds; runs via BuildKit):
+  ```bash
+  curl -sSL https://railpack.com/install.sh | sh
+  ```
+
+### 2. Infrastructure Setup
 ```bash
-# 1. Environment + infrastructure
-cp .env.example .env                     # fill in DATABASE_URL/REDIS/SECRETS (see SETUP.md)
-docker compose -f docker-compose.dev.yml up -d     # postgres :5432, redis :6380, traefik :80/:8081
+# Clone the repository
+git clone https://github.com/AyushCN/api-sandbox-links.git
+cd api-sandbox-links
 
-# 2. Backend — build from backend/ (that's where go.mod lives), run from the repo root
+# Configure environment variables
+cp .env.example .env
+
+# Spin up Postgres (5434), Redis (6380), Traefik (80/8081), and BuildKit (1234)
+docker compose -f docker-compose.dev.yml up -d
+```
+
+### 3. Backend Service
+```bash
+# Build binary from backend/ (where go.mod resides)
 cd backend && go build -o server ./cmd/server && cd ..
-./backend/server &                       # :8080 API + :8090 gateway
 
-# 3. Frontend
-cd frontend && npm i && npm run dev      # http://localhost:3000
+# Launch backend from the repository root (reads root .env)
+./backend/server
 ```
+*Note: In dev mode (`GITHUB_CLIENT_ID` empty in `.env`), the backend auto-authenticates requests as a local developer user.*
 
-Paste `https://github.com/heroku/node-js-sample` (branch `master`) in the dashboard's create form to try it end-to-end.
-
-## Architecture at a glance
-
+### 4. Frontend Application
+```bash
+cd frontend
+npm install
+npm run dev
 ```
-Browser ── :3000 (Next.js) ──> API :8080 (chi, PostgreSQL, Redis) ──> Docker (railpack/nixpacks images, per-sandbox containers)
-Browser ── :80 (Traefik file provider) ──> gateway :8090 ──> sandbox container (wake-on-request before forwarding)
-Browser ── ws :8080 ──> live logs (xterm) + live metrics (recharts)
-```
+Open **[http://localhost:3000](http://localhost:3000)** in your browser to access the dashboard.
 
-The routing detail that matters: sandbox HTTP traffic does **not** hit the API on `:8080`. Traefik's file provider routes every `*.sandbox.localhost` host to the backend's **gateway listener on `:8090`**, which resolves the sandbox by subdomain, wakes it if hibernating, and reverse-proxies. See `docs/ARCHITECTURE.md`.
+---
 
-## Repo layout
+## Repository Structure
 
 ```
-backend/   Go 1.25 service (chi) — auth, orchestrator (Docker), git, deployer, gateway, WS
-frontend/  Next.js 16 (App Router, Tailwind v4) dashboard & sandbox console
-traefik/   dynamic file-provider config (wildcard edge router)
-docs/      architecture, API, DB, and setup walkthroughs
-docker-compose.dev.yml   local infra (postgres, redis, traefik) + volume
+api-sandbox-links/
+├── backend/                  # Go service (Chi, GORM, Docker Engine SDK, BuildKit)
+│   ├── cmd/server/           # Application entrypoint
+│   ├── internal/api/         # REST routes, WebSockets, auth, and gateway proxy
+│   ├── internal/orchestrator/# Container lifecycle, Railpack/Dockerfile builders, sidecars
+│   ├── internal/db/          # Database queries and GORM schemas
+│   └── migrations/           # Versioned SQL migrations
+├── frontend/                 # Next.js 16 (React 19, Tailwind CSS v4, Monaco Editor)
+│   ├── app/                  # App Router pages (Landing, Dashboard, Projects, IDE)
+│   ├── components/           # UI components, terminal consoles, theme toggle
+│   └── lib/                  # Auth state, theme provider, persistent projects store
+├── docs/                     # Detailed architectural specifications & guides
+│   ├── ARCHITECTURE.md       # Deep dive into routing, wake-on-request & builders
+│   ├── SETUP.md              # Complete dev environment runbook & troubleshooting
+│   ├── API.md                # Comprehensive REST & WebSocket endpoint catalog
+│   ├── DATABASE.md           # Schema definitions and data lifecycle models
+│   ├── SECURITY.md           # Threat models, gVisor containment & auth tokens
+│   └── RUNBOOK.md            # Production deployment and operations guide
+├── traefik/                  # Traefik dynamic file configuration
+└── docker-compose.dev.yml    # Development infrastructure stack
 ```
 
-## Documentation
+---
 
-- `docs/README.md` — documentation index
-- `docs/SETUP.md` — environment, prerequisites, build order, OAuth, troubleshooting
-- `docs/ARCHITECTURE.md` — system design, routing, wake-on-request, port discovery, reapers
-- `docs/API.md` — every endpoint, request/response shapes, WebSocket protocols
-- `docs/DATABASE.md` — schema, migrations, GORM table-name caveats
+## Documentation Index
 
-All docs are cross-referenced to the code that defines them (config keys, schema,
-routes), so they can be verified quickly when behaviour changes.
+Explore our comprehensive technical documentation:
 
-## Status
+- 📖 **[docs/README.md](docs/README.md)** — Master documentation index and reading order.
+- ⚙️ **[backend/README.md](backend/README.md)** — Go backend architecture, two listeners (`:8080` & `:8090`), builders, and tests.
+- 🎨 **[frontend/README.md](frontend/README.md)** — Next.js 16 Web IDE, ash grey terminals, workspace projects, and theme tokens.
+- 🛠️ **[docs/SETUP.md](docs/SETUP.md)** — Step-by-step development setup, port mapping (`:5434`, `:6380`, `:1234`), and debugging guide.
+- 🏛️ **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — System architecture, gateway proxy, wake-on-request, and container lifecycles.
+- 📡 **[docs/API.md](docs/API.md)** — Complete API specifications for Sandboxes, Workspace Projects, and WebSockets.
+- 🗄️ **[docs/DATABASE.md](docs/DATABASE.md)** — PostgreSQL schema models, GORM definitions, and retention rules.
+- 🔒 **[docs/SECURITY.md](docs/SECURITY.md)** — Threat model, capability dropping, AES-256 token encryption, and gVisor sandboxing.
+- 🚀 **[docs/RUNBOOK.md](docs/RUNBOOK.md)** — Production operations, systemd unit definitions, automated recovery, and TLS.
 
-Phase A–G implemented and verified end-to-end in dev: create → clone → build (Railpack default) → container running → public URL responds → hibernate/wake → file edit → save-redeploy → commit/push wired (push requires a real GitHub token from OAuth sign-in).
+---
+
+## License
+
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.

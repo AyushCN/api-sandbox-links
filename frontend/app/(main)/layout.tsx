@@ -58,6 +58,24 @@ export default function MainLayout({
       <main className="flex-1 w-full max-w-7xl mx-auto px-4 sm:px-8 py-8">
         {children}
       </main>
+
+      <footer className="w-full border-t border-outline-variant bg-surface-container-lowest/40 py-6 px-4 sm:px-8 transition-colors mt-auto">
+        <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-on-surface-variant">
+          <div className="flex items-center gap-2">
+            <div className="w-5 h-5 rounded-full bg-gradient-to-tr from-[#FF416C] to-[#FF4B2B] flex items-center justify-center text-white font-bold text-[10px]">
+              A
+            </div>
+            <span>© 2026 API Sandbox Links. All rights reserved.</span>
+          </div>
+          <div className="flex items-center gap-6">
+            <Link href="/" className="hover:text-on-surface transition-colors">Home</Link>
+            <Link href="/dashboard" className="hover:text-on-surface transition-colors">Sandboxes</Link>
+            <Link href="/projects" className="hover:text-on-surface transition-colors">Projects</Link>
+            <Link href="/privacy" className="hover:text-on-surface transition-colors">Privacy Policy</Link>
+            <Link href="/terms" className="hover:text-on-surface transition-colors">Terms of Service</Link>
+          </div>
+        </div>
+      </footer>
     </div>
   );
 }

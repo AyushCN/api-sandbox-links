@@ -1,112 +1,120 @@
-# Database
+# Database & Persistence Architecture
 
-PostgreSQL via GORM, with a hand-written SQL migration as the source of truth:
+The platform uses a layered persistence architecture:
+1. **PostgreSQL 16**: Relational storage for users, sandboxes, deployments, sidecar databases, and encrypted secrets.
+2. **Redis 7**: Ephemeral hot-state store for idle activity TTLs and live resource snapshot buffers.
+3. **Workspace Projects Store**: Fast, file-backed JSON store (`/tmp/api-sandbox-links/projects.json`) for collaborative multi-tenancy and project scoping.
 
-- **`backend/migrations/0001_init.up.sql`** — full schema. Applied on startup by
-  `db.Migrate` (recorded in `schema_migrations`).
-- **`backend/migrations/0002_snapshot_dedup.up.sql`** — adds the unique index on
-  `resource_snapshots (sandbox_id, recorded_at)` that makes the live-metrics
-  flush idempotent, deleting any duplicate rows the index would otherwise reject.
-- **`backend/migrations/0003_lifetime_starts_on_activation.up.sql`** — adds
-  `sandboxes.activated_at`, and moves the lifetime clock from `created_at` to the
-  first transition into `running`. See "When the lifetime starts" below.
+---
 
-Each has a matching `.down.sql`. Never edit an already-applied migration; add a
-new one.
-- **`backend/internal/db/models.go`** — GORM models mapping back onto those
-  tables. Schema changes always land as a new migration file first; keep the
-  models in sync.
+## 1. PostgreSQL Schema & Migrations
 
-> The migration header says it "matches BUILD_PROMPT.md verbatim" — don't trust
-> that; the file (and this doc) reflect the current schema.
+PostgreSQL is accessed via GORM in the Go backend. Database migrations are strictly managed through sequential SQL files located in [`backend/migrations/`](file:///home/swordrookie/projects/api_sandbox_links/api-sandbox-links/backend/migrations):
 
-## GORM table-name caveats
+- `0001_init.up.sql`: Initial schema (users, repositories, sandboxes, env vars, databases, deployments, snapshots, audit log).
+- `0002_snapshot_dedup.up.sql`: Unique constraint on `resource_snapshots(sandbox_id, recorded_at)` ensuring idempotent 10s metric flushes.
+- `0003_lifetime_starts_on_activation.up.sql`: Adds `sandboxes.activated_at` to ensure sandbox lifetime begins only when status transitions to `running`.
 
-GORM pluralizes model names unless `TableName()` overrides them. The overrides
-exist because those two don't pluralize to the migration's names:
+### Local Development Connection
+The Postgres container runs on host port **`5434`** (mapped to container port `5432` in `docker-compose.dev.yml` to prevent local port conflicts):
+```
+postgres://user:pass@localhost:5434/sandbox_platform?sslmode=disable
+```
 
-| Model | Table |
+---
+
+## 2. Relational Table Schema Reference
+
+### Table Overviews
+
+| Table | Primary Purpose | Key Columns & Indexes |
+|---|---|---|
+| `users` | Authenticated developers | `id uuid pk`, `github_id bigint unique`, `username`, `email`, `github_token bytea` (AES-256-GCM encrypted) |
+| `repositories` | Registered GitHub repositories | `id uuid pk`, `user_id fk`, `github_url`, `default_branch`, `unique(user_id, github_url)` |
+| `sandboxes` | Container environments | `id uuid pk`, `subdomain unique`, `status`, `container_id`, `internal_port`, `idle_timeout_seconds`, `activated_at`, `expires_at`, `build_config jsonb` |
+| `sandbox_env_vars` | Decrypted runtime variables | `id uuid pk`, `sandbox_id fk`, `key`, `value bytea` (encrypted), `unique(sandbox_id, key)` |
+| `sandbox_databases` | Per-sandbox sidecar DBs | `id uuid pk`, `sandbox_id fk`, `engine` (`postgres\|mysql`), `container_id`, `connection_url bytea` (encrypted) |
+| `sandbox_lifetime_warnings` | Deduplicated alert thresholds | `id uuid pk`, `sandbox_id fk`, `threshold` (`24h\|1h\|5m`), `sent_at`, `unique(sandbox_id, threshold)` |
+| `deployments` | Build & deploy history | `id uuid pk`, `sandbox_id fk`, `trigger` (`initial\|save_redeploy\|github_push`), `status`, `log_excerpt` |
+| `resource_snapshots` | 10s container metric samples | `id bigint pk`, `sandbox_id fk`, `cpu_percent`, `memory_used_bytes`, `recorded_at`, `unique(sandbox_id, recorded_at)` |
+| `file_edits` | In-browser IDE change audits | `id uuid pk`, `sandbox_id fk`, `file_path`, `edited_by fk`, `edited_at`, `pushed_to_github` |
+
+### GORM Table-Name Mappings
+GORM pluralizes Go structs unless explicitly overridden via `TableName()`. The following mappings are configured in [`backend/internal/db/models.go`](file:///home/swordrookie/projects/api_sandbox_links/api-sandbox-links/backend/internal/db/models.go):
+
+| Go Model Struct | Physical Database Table |
 |---|---|
 | `EnvVar` | `sandbox_env_vars` |
 | `LifetimeWarning` | `sandbox_lifetime_warnings` |
 | `Repository` | `repositories` |
+| `SandboxDatabase` | `sandbox_databases` |
 
-Everything else (`users`, `sandboxes`, `sandbox_databases`, `deployments`,
-`resource_snapshots`, `file_edits`) pluralizes normally. Forgetting an override
-produces a runtime `relation "env_vars" does not exist` on the next save.
+---
 
-## Tables
+## 3. Lifetime Accounting (`activated_at`)
 
-| Table | Columns / notes |
-|---|---|
-| `users` | `id uuid pk`, `github_id bigint unique`, `username`, `email`, `avatar_url`, `github_token bytea not null` (AES-GCM encrypted), `created_at`. |
-| `repositories` | per-user repo registry: `user_id` fk, `github_url`, `default_branch`, `created_at`, `unique(user_id, github_url)`. Created on first sandbox for that repo. |
-| `sandboxes` | `id`, `repository_id` fk, `parent_sandbox_id` (fork), `branch_name`, `subdomain unique`, `status`, `container_id`, `image_tag`, `internal_port`, `idle_timeout_seconds` (default 900), `last_request_at`, `lifetime_seconds` (default 86400), `expires_at`, `activated_at`, `destroyed_at`, `destruction_reason`, `detected_language`, `build_config jsonb`, `ai_suggested_env jsonb`, `created_at`, `updated_at`. Indexes on `status`, `parent_sandbox_id`, partial on `expires_at WHERE destroyed_at IS NULL`, and partial on `created_at WHERE activated_at IS NULL AND destroyed_at IS NULL` (the "still building" support query — the expiry reaper scans `expires_at`, not `activated_at`, so it needs no new index). |
-| `sandbox_env_vars` | `id`, `sandbox_id` fk, `key`, `value bytea` (encrypted), `is_ai_suggested`, `unique(sandbox_id, key)`. |
-| `sandbox_databases` | sidecar DBs: `sandbox_id` fk, `engine` (`postgres\|mysql\|sqlite`), `container_id`, `connection_url bytea` (encrypted), `forked_from`, `created_at`. One per sandbox; persisted across redeploys. |
-| `sandbox_lifetime_warnings` | dedup of sent warnings: `sandbox_id` fk, `threshold` (`24h\|1h\|5m` or proportional), `sent_at`, `unique(sandbox_id, threshold)`. |
-| `deployments` | per-deploy history: `deployment` – `id`, `sandbox_id` fk, `trigger` (`initial\|save_redeploy\|github_push\|manual\|fork`), `status` (`pending\|building\|success\|failed`), `log_excerpt`, `started_at`, `finished_at`. |
-| `resource_snapshots` | metric samples written every 10s while a sandbox runs: `cpu_percent real` (computed from counter deltas, not Docker's raw totals), `memory_used_bytes` (page-cache-adjusted), `memory_limit_bytes`, `network_rx_bytes`, `network_tx_bytes` (per-sample deltas summed across interfaces), `recorded_at`; index `(sandbox_id, recorded_at)`. Append-only while the sandbox runs, pruned on teardown and after **7 days** by the hourly snapshot reaper. Backs `GET /stats/history?range=1h\|6h\|24h\|7d`. A unique index on `(sandbox_id, recorded_at)` makes the 10s flush idempotent, so a retried flush cannot double-count a sample. |
-| `file_edits` | optional audit trail of editor saves: `sandbox_id`, `file_path`, `edited_by` → `users`, `edited_at`, `pushed_to_github`. |
+A sandbox's expiration deadline is a guarantee of usable uptime. Build times—which can take 1 to 3 minutes for large repositories—must **never** consume the user's allocated lifetime.
 
-There are **no** `github_commits`, `sandbox_stats_rollups`, or
-`lifetime_warning_dismissals` tables despite earlier docs; those features are not
-in the current schema.
+1. **Creation**: When a sandbox is initialized, `expires_at` is provisionally set to `created_at + lifetime_seconds` as a fallback timeout in case the build hangs.
+2. **Activation**: The moment the sandbox successfully builds and its container reaches `running`, the orchestrator executes an atomic conditional update:
+   ```sql
+   UPDATE sandboxes
+      SET status = 'running',
+          activated_at = NOW(),
+          expires_at = NOW() + (lifetime_seconds || ' seconds')::interval
+    WHERE id = $1 AND activated_at IS NULL;
+   ```
+3. **Idempotency**: The `activated_at IS NULL` condition ensures that subsequent redeployments or container restarts do not improperly reset the original lifetime expiration.
 
-## When the lifetime starts
+---
 
-The lifetime is a promise about how long a *usable link* lives, so the clock must
-not run while the sandbox is still being built. `expires_at` was previously fixed
-at `created_at + lifetime_seconds`, which meant a 5-minute sandbox whose build
-took 3 minutes was destroyed 2 minutes after it came up — and a build longer than
-the entire lifetime was destroyed before it ever went live.
+## 4. Redis Hot-State Storage
 
-`activated_at` records the moment the sandbox first reached `running`. The deploy
-path claims it with a conditional update, so exactly one transition wins:
+Redis operates strictly as an ephemeral cache and signaling bus; no permanent data relies on Redis:
 
-```sql
-UPDATE sandboxes
-   SET status = $2, activated_at = $3, expires_at = $3 + $4
- WHERE id = $1 AND activated_at IS NULL
+| Key Pattern | Data Type | TTL | Purpose |
+|---|---|---|---|
+| `lr:<sandbox_id>` | String timestamp | `idle_timeout_seconds` (default 900s) | Refreshed on every HTTP request by the Gateway `:8090`. Expiration triggers the idle reaper to hibernate the container. |
+| `stats:latest:<sandbox_id>` | JSON object | `10s` | Buffer written by the real-time `docker stats` collector. Flushed to Postgres `resource_snapshots` every 10s by `StatsFlushWorker`. |
+
+---
+
+## 5. Workspace Projects Data Store
+
+Workspace Projects, collaborative member roles, and project-to-sandbox associations are managed through a high-performance JSON store at `/tmp/api-sandbox-links/projects.json`.
+
+### Project Entity Structure
+```json
+{
+  "id": "proj-microservices",
+  "name": "Payment Microservices",
+  "description": "Internal payment APIs and webhook testing",
+  "owner": "AyushCN",
+  "collaborators": [
+    {
+      "id": "collab-1",
+      "userId": "AyushCN",
+      "username": "AyushCN",
+      "email": "ayush@example.com",
+      "role": "OWNER"
+    }
+  ],
+  "repositories": [
+    {
+      "id": "repo-1",
+      "name": "payment-api",
+      "url": "https://github.com/org/payment-api",
+      "defaultBranch": "main"
+    }
+  ],
+  "sandboxIds": [
+    "0d9a52df-fe54-45dc-8b73-d4b936f2e55b"
+  ],
+  "createdAt": "2026-11-15T06:00:00.000Z"
+}
 ```
 
-The `activated_at IS NULL` guard is what stops a redeploy — which also passes
-through `building → running` — from handing out a fresh full lifetime every time.
-Under concurrent claims exactly one row is updated; the rest see zero rows
-affected and fall through to the destroyed-row check.
-
-`expires_at` stays `NOT NULL` and is still set at creation. That provisional
-`created_at + lifetime` value remains the deadline for a sandbox that never
-activates, so a build that hangs or fails cannot leak a row forever. The
-trade-off is deliberate: if a build outlives the provisional deadline, the expiry
-reaper tombstones it before it ever activates. Extension caps are anchored on
-`activated_at` where present, so build time cannot eat into the extension
-allowance.
-
-A destroyed row is never resurrected. `MarkSandboxActive` returns
-`ErrSandboxDestroyed`, and the deploy path tears the freshly built container down
-and records the deployment as failed rather than reviving the sandbox.
-
-## Session storage
-
-Auth is **stateless**: the cookie `asl_session` is an AES-GCM ciphertext of the
-user's GitHub numeric ID (`SECRETS_ENCRYPTION_KEY`, 32 bytes base64 — set in
-`.env`). There is no session table; the ID is decrypted and looked up in `users`
-per request. Dev auth mode skips cookies entirely and fabricates the `devuser`.
-
-## Data flow notes
-
-- Redis holds only transient state: per-sandbox idle TTL keys `lr:<id>` (the
-  idle-reaper contract; touched by the gateway on traffic and set at deploy time)
-  and the newest live metric per sandbox, `stats:latest:<id>` (10s TTL, written
-  by the stats collector, read by the 10s flush worker). Nothing durable lives in
-  Redis. The TTL is deliberate: if a container's stats stream dies the key
-  expires instead of leaving a frozen reading to be persisted as if it were live.
-- Env vars and DB connection URLs are encrypted at rest with the same
-  `EncryptionKey` used for the session cookie; they are decrypted only when
-  assembling container env.
-- Forks copy the parent's working tree into a new volume, then write a
-  `parent_sandbox_id` pointer on the new sandbox (and `forked_from` on a sidecar
-  DB if one is copied); the parent's deployments/snapshots are untouched.
-- Destroys cascade in `TeardownSandbox`: container → sidecar DB → volume →
-  network, plus pruning of deployments/snapshots.
+### Multi-Tenancy Scoping (`filterSandboxesForProject`)
+1. **The Default Project (`default-project`)**: Captures all sandboxes not explicitly bound to any custom workspace project.
+2. **Custom Projects**: Only surface sandboxes whose IDs are explicitly recorded in `project.sandboxIds`.
+3. **Automatic Persistence**: Changes made via the UI (creating projects, inviting members, linking sandboxes) immediately sync to disk with atomic write locks.

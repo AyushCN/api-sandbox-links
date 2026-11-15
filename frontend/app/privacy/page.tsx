@@ -1,130 +1,150 @@
+"use client";
+
 import React from "react";
 import Link from "next/link";
-import { Lock } from "lucide-react";
+import { Lock, Shield, Database, Trash2, Server, ArrowLeft, ArrowRight } from "lucide-react";
+import { ThemeToggle } from "@/components/ThemeToggle";
 
 export default function PrivacyPage() {
   return (
-    <div className="min-h-screen bg-[#0d0e12] flex flex-col items-center">
-      <nav className="w-full max-w-4xl mx-auto px-6 py-6 flex justify-between items-center border-b border-white/5">
-        <Link
-          href="/"
-          className="text-xl font-bold text-white flex items-center gap-2"
-        >
-          <div className="w-8 h-8 bg-primary rounded-lg flex items-center justify-center shadow-[0_0_15px_rgba(var(--primary-rgb),0.5)]">
-            <span className="text-on-primary text-lg leading-none">{"<"}</span>
-          </div>
-          API Sandbox
-        </Link>
-        <Link
-          href="/"
-          className="text-sm font-medium text-white/50 hover:text-white transition-colors"
-        >
-          Back to Home
-        </Link>
-      </nav>
+    <div className="min-h-screen bg-background text-on-surface flex flex-col justify-between transition-colors duration-200 font-sans selection:bg-[#FF416C] selection:text-white">
+      {/* Top Header */}
+      <header className="sticky top-0 z-50 w-full px-4 sm:px-8 py-3 bg-surface/85 backdrop-blur-xl border-b border-outline-variant transition-colors">
+        <div className="max-w-5xl mx-auto flex items-center justify-between h-12">
+          <Link
+            href="/"
+            className="flex items-center gap-2.5 hover:opacity-90 transition-opacity"
+          >
+            <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-[#FF416C] to-[#FF4B2B] flex items-center justify-center text-white font-bold text-xs shadow-md">
+              A
+            </div>
+            <span className="font-bold tracking-tight text-base text-on-surface">
+              API Sandbox
+            </span>
+          </Link>
 
-      <main className="w-full max-w-4xl mx-auto px-6 py-12 flex flex-col gap-10 text-white/80">
+          <div className="flex items-center gap-4 text-xs font-semibold uppercase tracking-wider text-on-surface-variant">
+            <Link
+              href="/"
+              className="hover:text-on-surface transition-colors hidden sm:flex items-center gap-1"
+            >
+              <ArrowLeft className="w-3.5 h-3.5" />
+              <span>Home</span>
+            </Link>
+            <Link
+              href="/terms"
+              className="hover:text-on-surface transition-colors hidden sm:inline"
+            >
+              Terms
+            </Link>
+            <Link
+              href="/dashboard"
+              className="hover:text-on-surface transition-colors"
+            >
+              Dashboard
+            </Link>
+            <ThemeToggle />
+          </div>
+        </div>
+      </header>
+
+      {/* Main Content */}
+      <main className="flex-1 w-full max-w-4xl mx-auto px-6 py-12 flex flex-col gap-10">
         <div>
-          <h1 className="text-4xl font-black text-white mb-4">
+          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-surface-container border border-outline-variant text-[11px] font-mono font-bold uppercase tracking-wider text-on-surface-variant mb-4">
+            Security & Governance
+          </div>
+          <h1 className="text-3xl sm:text-4xl font-extrabold tracking-tight text-on-surface mb-2">
             Privacy Policy
           </h1>
-          <p className="text-lg text-white/60">Last updated: August 2026</p>
+          <p className="text-sm text-on-surface-variant">
+            Last updated: November 2026 • Zero-knowledge token lifecycle & ephemeral workspace policies.
+          </p>
         </div>
 
-        <section className="flex flex-col gap-4">
-          <h2 className="text-2xl font-bold text-white flex items-center gap-2">
-            <Lock className="w-6 h-6 text-primary" />
-            1. GitHub OAuth and Permissions
-          </h2>
-          <p>
-            API Sandbox uses GitHub OAuth to authenticate users and orchestrate
-            development environments directly from your repositories. We request
-            the following OAuth scopes:
-          </p>
-          <ul className="list-disc pl-6 space-y-2 text-white/70">
-            <li>
-              <strong>`user:email`</strong>: Used strictly to uniquely identify
-              your account and send necessary service notifications.
-            </li>
-            <li>
-              <strong>`repo`</strong>: Required to clone repositories into your
-              ephemeral sandbox and push commits back to GitHub.{" "}
-              <em>
-                Note: The `repo` scope is broad and grants read/write access to
-                your accessible repositories. We only interact with repositories
-                you explicitly orchestrate or push from within the platform UI.
-              </em>
-            </li>
-          </ul>
-        </section>
+        <div className="space-y-8 text-sm leading-relaxed text-on-surface/90">
+          <section id="github-oauth" className="bg-surface-container-lowest border border-outline-variant rounded-2xl p-6 sm:p-8 space-y-4 shadow-sm scroll-mt-24">
+            <h2 className="text-xl font-bold text-on-surface flex items-center gap-2.5">
+              <Lock className="w-5 h-5 text-[#FF416C]" />
+              1. GitHub OAuth and Scopes
+            </h2>
+            <p className="text-on-surface-variant">
+              API Sandbox utilizes GitHub OAuth exclusively for zero-friction developer authentication and repository orchestration. We only request the minimum permissions required to run your ephemeral environments:
+            </p>
+            <ul className="list-disc pl-5 space-y-2 text-on-surface-variant">
+              <li>
+                <strong className="text-on-surface">user:email</strong>: Identifies your engineering user session and prevents unauthorized access to private sandbox instances.
+              </li>
+              <li>
+                <strong className="text-on-surface">repo</strong>: Required solely to securely clone the target repositories into your ephemeral container volume and push user-initiated commits from the in-browser IDE back to your remote branches.
+              </li>
+            </ul>
+          </section>
 
-        <section className="flex flex-col gap-4">
-          <h2 className="text-2xl font-bold text-white">
-            2. Token Storage & Security
-          </h2>
-          <p>
-            Your GitHub OAuth token is stored <strong>encrypted</strong>{" "}
-            server-side using AES-256. It is solely utilized by the backend
-            worker to securely orchestrate git clones and execute pushes on your
-            behalf.
-          </p>
-        </section>
+          <section id="security" className="bg-surface-container-lowest border border-outline-variant rounded-2xl p-6 sm:p-8 space-y-4 shadow-sm scroll-mt-24">
+            <h2 className="text-xl font-bold text-on-surface flex items-center gap-2.5">
+              <Shield className="w-5 h-5 text-emerald-500" />
+              2. Token Storage & Encryption at Rest
+            </h2>
+            <p className="text-on-surface-variant">
+              Your OAuth tokens are never transmitted unencrypted or exposed in client bundles. Tokens are encrypted at rest using AES-256-GCM authenticated encryption utilizing a host-isolated master key (<code className="text-xs font-mono bg-surface-container px-1.5 py-0.5 rounded">SECRETS_ENCRYPTION_KEY</code>). Decryption is permitted strictly inside server-side Go orchestrators when performing authenticated Git pulls and pushes.
+            </p>
+          </section>
 
-        <section className="flex flex-col gap-4">
-          <h2 className="text-2xl font-bold text-white">
-            3. Data We Collect and Store
-          </h2>
-          <p>
-            In order to provide the sandbox orchestration service, we store:
-          </p>
-          <ul className="list-disc pl-6 space-y-2 text-white/70">
-            <li>
-              <strong>Account Data:</strong> Your GitHub username, email, and
-              encrypted OAuth token.
-            </li>
-            <li>
-              <strong>Environment Metadata:</strong> Repository URLs, active
-              branch names, and sandbox lifecycle status.
-            </li>
-            <li>
-              <strong>Logs & Metrics:</strong> System crash logs and basic
-              telemetry (e.g., container memory/CPU) to ensure platform
-              stability.
-            </li>
-            <li>
-              <strong>Workspace Files:</strong> Your code is temporarily
-              persisted on the host disk while the sandbox environment exists.
-            </li>
-          </ul>
-        </section>
+          <section id="data-collected" className="bg-surface-container-lowest border border-outline-variant rounded-2xl p-6 sm:p-8 space-y-4 shadow-sm scroll-mt-24">
+            <h2 className="text-xl font-bold text-on-surface flex items-center gap-2.5">
+              <Database className="w-5 h-5 text-sky-500" />
+              3. Data We Collect and Store
+            </h2>
+            <p className="text-on-surface-variant">
+              To provide deterministic runtime execution, our control plane temporarily stores:
+            </p>
+            <ul className="list-disc pl-5 space-y-2 text-on-surface-variant">
+              <li><strong className="text-on-surface">Developer Profile</strong>: GitHub username, avatar, and linked email address.</li>
+              <li><strong className="text-on-surface">Environment Metadata</strong>: Repository URL, selected branch, container port, and builder type.</li>
+              <li><strong className="text-on-surface">Runtime Telemetry</strong>: Real-time container exit codes, memory metrics, and live stdout/stderr logs streamed over WebSockets.</li>
+              <li><strong className="text-on-surface">Workspace Files</strong>: Temporary project source code on the dedicated sandbox host disk.</li>
+            </ul>
+          </section>
 
-        <section className="flex flex-col gap-4">
-          <h2 className="text-2xl font-bold text-white">
-            4. Data Deletion & Ephemerality
-          </h2>
-          <p>
-            When a sandbox environment is destroyed (either manually by you, or
-            automatically via the idle garbage collector), all associated
-            workspace files on disk are completely deleted on a best-effort
-            basis. Your code only lives on our host while the environment
-            remains active.
-          </p>
-          <p>We do not sell your personal data to third parties.</p>
-        </section>
+          <section id="ephemerality" className="bg-surface-container-lowest border border-outline-variant rounded-2xl p-6 sm:p-8 space-y-4 shadow-sm scroll-mt-24">
+            <h2 className="text-xl font-bold text-on-surface flex items-center gap-2.5">
+              <Trash2 className="w-5 h-5 text-amber-500" />
+              4. Ephemeral Lifecycles & Automated Idle Reaping
+            </h2>
+            <p className="text-on-surface-variant">
+              Sandboxes are strictly ephemeral by design. When an environment is destroyed—whether explicitly deleted by you or automatically reaped by the background inactivity cleaner—all ephemeral container filesystems, sidecar volumes, and host directories are permanently wiped clean. We do not retain, backup, or sell your source code.
+            </p>
+          </section>
 
-        <section className="flex flex-col gap-4">
-          <h2 className="text-2xl font-bold text-white">
-            5. Self-Hosting Disclosures
-          </h2>
-          <p>
-            The API Sandbox control plane uses Docker on a host infrastructure.
-            Operators of a self-hosted instance of API Sandbox are solely
-            responsible for their own legal and privacy compliance. For privacy
-            or security reports concerning this specific deployment, please
-            contact the administrators of this instance.
-          </p>
-        </section>
+          <section id="self-hosting" className="bg-surface-container-lowest border border-outline-variant rounded-2xl p-6 sm:p-8 space-y-4 shadow-sm scroll-mt-24">
+            <h2 className="text-xl font-bold text-on-surface flex items-center gap-2.5">
+              <Server className="w-5 h-5 text-purple-500" />
+              5. Self-Hosting Disclosures & Security Reports
+            </h2>
+            <p className="text-on-surface-variant">
+              When deployed on your own infrastructure, your team retains 100% control over the host boundaries, Docker daemon socket, and network proxies. To report platform vulnerabilities or clarify security policies, please reach out to your system administrator or open an issue on our GitHub repository.
+            </p>
+          </section>
+        </div>
       </main>
+
+      {/* Footer */}
+      <footer className="w-full border-t border-outline-variant bg-surface-container-lowest/50 py-8 px-6 mt-12 transition-colors">
+        <div className="max-w-5xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-on-surface-variant">
+          <div className="flex items-center gap-2">
+            <div className="w-5 h-5 rounded-full bg-gradient-to-tr from-[#FF416C] to-[#FF4B2B] flex items-center justify-center text-white font-bold text-[10px]">
+              A
+            </div>
+            <span>© 2026 API Sandbox Links. All rights reserved.</span>
+          </div>
+          <div className="flex items-center gap-6">
+            <Link href="/" className="hover:text-on-surface transition-colors">Home</Link>
+            <Link href="/terms" className="hover:text-on-surface transition-colors">Terms of Service</Link>
+            <Link href="/dashboard" className="hover:text-on-surface transition-colors">Dashboard</Link>
+          </div>
+        </div>
+      </footer>
     </div>
   );
 }
