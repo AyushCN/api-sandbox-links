@@ -88,6 +88,8 @@ func (s *Server) Router() http.Handler {
 			"dev_auth": s.cfg.DevAuth,
 		})
 	})
+	r.Get("/api/quota", s.handleQuota)
+	r.Get("/api/build/ws", s.handleBuildWS)
 	r.Get("/api/ready", s.handleReady)
 
 	// Public auth endpoints.
@@ -114,10 +116,16 @@ func (s *Server) Router() http.Handler {
 			pr.Post("/{id}/actions/extend", s.handleExtendLifetime)
 			pr.Post("/{id}/actions/destroy", s.handleDestroySandbox)
 			pr.Post("/{id}/actions/recreate", s.handleRecreateSandbox)
+			pr.Post("/{id}/actions/retry", s.handleRetry)
+			pr.Post("/{id}/actions/stop", s.handleStop)
+			pr.Post("/{id}/actions/start", s.handleStart)
+			pr.Post("/{id}/actions/settings", s.handleSettings)
 			pr.Post("/{id}/fork", s.handleForkSandbox)
 			pr.Get("/{id}/deployments", s.handleListDeployments)
 			pr.Post("/{id}/deploy", s.handleRedeploy)
 			pr.Get("/{id}/warnings", s.handleSandboxWarnings)
+			pr.Get("/{id}/containers", s.handleContainers)
+			pr.Get("/{id}/events/ws", s.handleEventsWS)
 			pr.Get("/{id}/stats/history", s.handleStatsHistory)
 
 			// Phase F/G: in-browser editor + git push.
@@ -144,8 +152,12 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 // writeErr is the standard error envelope; details are never secrets.
-func writeErr(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]any{"error": msg})
+func writeErr(w http.ResponseWriter, status int, msg string, errorCode ...string) {
+	entry := map[string]any{"error": msg}
+	if len(errorCode) > 0 {
+		entry["error_code"] = errorCode[0]
+	}
+	writeJSON(w, status, entry)
 }
 
 // loggingMiddleware records each request's method, path, duration, and status.

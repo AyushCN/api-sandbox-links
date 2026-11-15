@@ -1,0 +1,37 @@
+# Production edge. Caddy terminates TLS for the app and every sandbox wildcard.
+#
+# Wildcard certificates need a DNS-01 challenge. The image built by
+# deploy/caddy/Dockerfile includes the Cloudflare DNS plugin; set CF_API_TOKEN
+# (scoped to Zone.DNS:Edit for the zone). For another DNS provider, swap the
+# plugin in that Dockerfile and the `dns` line below.
+{
+	email {$ACME_EMAIL}
+	admin off
+}
+
+{$APP_DOMAIN} {
+	encode zstd gzip
+
+	handle /api/* {
+		reverse_proxy host.docker.internal:8080
+	}
+
+	handle {
+		reverse_proxy frontend:3000
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+}
+
+*.{$SANDBOX_BASE_DOMAIN} {
+	tls {
+		dns cloudflare {$CF_API_TOKEN}
+	}
+	encode zstd gzip
+	reverse_proxy host.docker.internal:8090
+}

@@ -83,6 +83,10 @@ type Config struct {
 	// 'queued') until a slot frees. Default 2.
 	BuildConcurrency int
 
+	// SandboxScheme is the public URL scheme for sandbox links. Production
+	// defaults to https because wildcard TLS terminates at the edge.
+	SandboxScheme string
+
 	// BuildMode is how images are built. "host-docker" runs nixpacks/docker on
 	// the host; this is the only supported production mode and it is explicitly
 	// allowed (with a startup warning) because the backend already trusts the
@@ -133,6 +137,7 @@ func Load() (*Config, error) {
 		MaxActiveSandboxesPerUser: envIntDefault("MAX_ACTIVE_SANDBOXES_PER_USER", 3),
 		MaxRunningSandboxes:       envIntDefault("MAX_RUNNING_SANDBOXES", 6),
 		BuildConcurrency:          envIntDefault("BUILD_CONCURRENCY", 2),
+		SandboxScheme:             envDefault("SANDBOX_SCHEME", defaultSandboxScheme()),
 		BuildMode:                 envDefault("BUILD_MODE", "host-docker"),
 		BuildCPUQuota:             envFloatDefault("BUILD_CPU_QUOTA", 1.5),
 		BuildMemoryMB:             envIntDefault("BUILD_MEMORY_MB", 2048),
@@ -166,6 +171,12 @@ func Load() (*Config, error) {
 		if cfg.GitHubClientSecret == "" {
 			problems = append(problems, "APP_ENV=production requires GITHUB_CLIENT_SECRET")
 		}
+	}
+	if cfg.SandboxScheme != "http" && cfg.SandboxScheme != "https" {
+		problems = append(problems, fmt.Sprintf("SANDBOX_SCHEME must be http or https, got %q", cfg.SandboxScheme))
+	}
+	if cfg.AppEnv == "production" && cfg.SandboxScheme != "https" {
+		problems = append(problems, "APP_ENV=production requires SANDBOX_SCHEME=https")
 	}
 	if cfg.BuildMode != "host-docker" && cfg.BuildMode != "disabled" {
 		problems = append(problems, fmt.Sprintf("BUILD_MODE must be host-docker or disabled, got %q", cfg.BuildMode))
@@ -245,6 +256,13 @@ func envIntDefault(key string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+func defaultSandboxScheme() string {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("APP_ENV")), "production") {
+		return "https"
+	}
+	return "http"
 }
 
 func envFloatDefault(key string, fallback float64) float64 {

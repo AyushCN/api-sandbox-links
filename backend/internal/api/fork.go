@@ -43,6 +43,7 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Child lifetime = parent's remaining lifetime, clamped to [min, max].
+	// Must be within [MinLifetimeSeconds, maxLifetime()] just like create.
 	//
 	// The parent is already live, so its remaining time is the meaningful
 	// figure. The child is not: like any new sandbox it is created 'queued' and
@@ -52,7 +53,9 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 	remaining := time.Until(parent.ExpiresAt)
 	childLifetime := int64(remaining / time.Second)
 	if childLifetime < MinLifetimeSeconds {
-		childLifetime = MinLifetimeSeconds
+		writeErr(w, http.StatusBadRequest,
+			fmt.Sprintf("lifetime_seconds must be between %d and %d", MinLifetimeSeconds, s.maxLifetime()))
+		return
 	}
 	if childLifetime > s.maxLifetime() {
 		childLifetime = s.maxLifetime()

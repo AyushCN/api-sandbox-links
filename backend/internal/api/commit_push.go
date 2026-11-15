@@ -27,7 +27,7 @@ type commitPushRequest struct {
 func (s *Server) handleCommitPush(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.userFrom(r)
 	if !ok {
-		writeErr(w, http.StatusUnauthorized, "not signed in")
+		writeErr(w, http.StatusUnauthorized, "not signed in", "auth_unauthorized")
 		return
 	}
 	sb, ok := s.requireOwnedSandbox(w, r)
@@ -35,13 +35,13 @@ func (s *Server) handleCommitPush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if sb.DestroyedAt != nil {
-		writeErr(w, http.StatusConflict, "sandbox is destroyed; nothing to commit")
+		writeErr(w, http.StatusConflict, "sandbox is destroyed; nothing to commit", "nothing_to_commit")
 		return
 	}
 
 	var req commitPushRequest
 	if err := decodeJSON(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "message is required")
+		writeErr(w, http.StatusBadRequest, "message is required", "validation_missing_param")
 		return
 	}
 	message := req.Message
@@ -70,7 +70,7 @@ func (s *Server) handleCommitPush(w http.ResponseWriter, r *http.Request) {
 
 	token, err := s.decryptUserToken(user.ID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not read GitHub credentials")
+		writeErr(w, http.StatusInternalServerError, "could not read GitHub credentials", "read_github_creds_failed")
 		return
 	}
 

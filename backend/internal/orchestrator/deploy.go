@@ -236,8 +236,12 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 		LanguageVersion: project.Version,
 	})
 	if err != nil {
+		// Push build log lines to Redis on failure
+		_ = d.cache.AppendBuildLogBatch(ctx, sandbox.ID, buildLog.String())
 		return markFailed(err, buildLog.String())
 	}
+	// Push build log lines to Redis on success
+	_ = d.cache.AppendBuildLogBatch(ctx, sandbox.ID, buildLog.String())
 
 	// Shut down and remove any previous container so the new image takes over.
 	// Sidecar DB containers are untouched — only the app container is replaced.

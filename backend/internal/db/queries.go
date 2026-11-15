@@ -287,6 +287,28 @@ func (s *Store) ListActiveSandboxes() ([]*Sandbox, error) {
 	return out, nil
 }
 
+// CountActiveSandboxes returns the number of active (not destroyed) sandboxes
+// for a given user.
+func (s *Store) CountActiveSandboxes(userID string) (int, error) {
+	var count int64
+	if err := s.db.Raw(`SELECT count(*) FROM sandboxes s
+		JOIN repositories r ON r.id = s.repository_id
+		WHERE r.user_id = ? AND s.destroyed_at IS NULL`, userID).Scan(&count).Error; err != nil {
+		return 0, fmt.Errorf("db: counting active sandboxes: %w", err)
+	}
+	return int(count), nil
+}
+
+// CountGlobalRunningSandboxes returns the number of globally running sandboxes
+// platform-wide (across all users, excluding destroyed).
+func (s *Store) CountGlobalRunningSandboxes() (int, error) {
+	var count int64
+	if err := s.db.Raw(`SELECT count(*) FROM sandboxes WHERE destroyed_at IS NULL AND status = ?`, StatusRunning).Scan(&count).Error; err != nil {
+		return 0, fmt.Errorf("db: counting global running sandboxes: %w", err)
+	}
+	return int(count), nil
+}
+
 // ListAllSandboxes returns every row, including destroyed tombstones. Startup
 // reconciliation uses it to tell an orphaned Docker resource (no row at all)
 // apart from one whose sandbox is already terminal.

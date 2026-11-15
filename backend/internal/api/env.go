@@ -180,12 +180,12 @@ func (s *Server) handleUpdateEnv(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if sb.DestroyedAt != nil {
-		writeErr(w, http.StatusConflict, "This sandbox has been destroyed and cannot be edited.")
+		writeErr(w, http.StatusConflict, "This sandbox has been destroyed and cannot be edited.", "sandbox_destroyed_cannot_edit")
 		return
 	}
 	var req updateEnvRequest
 	if err := decodeJSON(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "Send a JSON body with env_vars.")
+		writeErr(w, http.StatusBadRequest, "Send a JSON body with env_vars.", "validation_missing_param")
 		return
 	}
 	if req.EnvVars == nil {
@@ -193,12 +193,12 @@ func (s *Server) handleUpdateEnv(w http.ResponseWriter, r *http.Request) {
 	}
 	repo, err := s.store.GetRepository(sb.RepositoryID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not load this sandbox's repository.")
+		writeErr(w, http.StatusInternalServerError, "Could not load this sandbox's repository.", "load_sandbox_repo_failed")
 		return
 	}
 	info, err := git.ParseGitHubURL(repo.GithubURL)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not read this sandbox's repository URL.")
+		writeErr(w, http.StatusInternalServerError, "Could not read this sandbox's repository URL.", "read_sandbox_repo_url_failed")
 		return
 	}
 	result, err := s.analyzer.Analyze(r.Context(), info.CloneURL, sb.BranchName)
@@ -209,7 +209,7 @@ func (s *Server) handleUpdateEnv(w http.ResponseWriter, r *http.Request) {
 	}
 	svc, err := servicesFromJSON(json.RawMessage(sb.ServicesOverride), "", result.Services)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "Invalid services selection.")
+		writeErr(w, http.StatusBadRequest, "Invalid services selection.", "validation_invalid_services")
 		return
 	}
 	// The editor deliberately starts with blank inputs and the API never
@@ -248,7 +248,7 @@ func (s *Server) handleUpdateEnv(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.replaceEnv(sb.ID, merged); err != nil {
 		s.logger.Warn("env update failed", slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
-		writeErr(w, http.StatusInternalServerError, "Could not save these settings.")
+		writeErr(w, http.StatusInternalServerError, "Could not save these settings.", "save_settings_failed")
 		return
 	}
 	patch := map[string]any{}

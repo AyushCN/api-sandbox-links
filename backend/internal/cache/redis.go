@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -107,6 +108,45 @@ func (r *Redis) LatestStat(ctx context.Context, sandboxID string) ([]byte, error
 		return nil, fmt.Errorf("cache: reading latest stat: %w", err)
 	}
 	return raw, nil
+}
+
+// BuildLogKey returns the Redis key for a sandbox's build log lines.
+func BuildLogKey(sandboxID string) string {
+	return "build:log:" + sandboxID
+}
+
+// AppendBuildLog appends a single line to the sandbox's build log in Redis.
+func (r *Redis) AppendBuildLog(ctx context.Context, sandboxID string, line string) error {
+	return r.client.RPush(ctx, BuildLogKey(sandboxID), line).Err()
+}
+
+// AppendBuildLogBatch appends all lines from a multi-line string to the
+// sandbox's build log in Redis.
+func (r *Redis) AppendBuildLogBatch(ctx context.Context, sandboxID string, content string) error {
+	lines := strings.Split(content, "\n")
+	pipeline := r.client.Pipeline()
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" {
+			pipeline.RPush(ctx, BuildLogKey(sandboxID), trimmed)
+		}
+	}
+	_, err := pipeline.Exec(ctx)
+	return err
+}
+
+// GetBuildLog returns all build log lines for a sandbox.
+func (r *Redis) GetBuildLog(ctx context.Context, sandboxID string) ([]string, error) {
+	raw, err := r.client.LRange(ctx, BuildLogKey(sandboxID), 0, -1).Result()
+	if err != nil {
+		return nil, fmt.Errorf("cache: reading build log: %w", err)
+	}
+	return raw, nil
+}
+
+// ClearBuildLog clears the build log for a sandbox.
+func (r *Redis) ClearBuildLog(ctx context.Context, sandboxID string) error {
+	return r.client.Del(ctx, BuildLogKey(sandboxID)).Err()
 }
 
 // StatFrame is the JSON shape published in Redis between the stats collector

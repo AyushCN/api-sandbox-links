@@ -22,6 +22,16 @@ import (
 	"github.com/google/uuid"
 )
 
+// contains reports whether the string slice contains the given value.
+func contains(s []string, e string) bool {
+	for _, v := range s {
+		if v == e {
+			return true
+		}
+	}
+	return false
+}
+
 // Lifetime constants shared with the frontend's picker.
 const (
 	// MaxLifetimeSeconds caps the planned lifetime (default 7 days, overridable
@@ -52,13 +62,13 @@ type createSandboxRequest struct {
 func (s *Server) handleListSandboxes(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.userFrom(r)
 	if !ok {
-		writeErr(w, http.StatusUnauthorized, "not signed in")
+		writeErr(w, http.StatusUnauthorized, "not signed in", "auth_unauthorized")
 		return
 	}
 	rows, err := s.store.ListSandboxes(user.ID)
 	if err != nil {
 		s.logger.Warn("list sandboxes failed", slog.String("err", err.Error()))
-		writeErr(w, http.StatusInternalServerError, "could not list sandboxes")
+		writeErr(w, http.StatusInternalServerError, "could not list sandboxes", "list_sandboxes_failed")
 		return
 	}
 	out := make([]map[string]any, 0, len(rows))
@@ -74,7 +84,7 @@ func (s *Server) handleListSandboxes(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.userFrom(r)
 	if !ok {
-		writeErr(w, http.StatusUnauthorized, "not signed in")
+		writeErr(w, http.StatusUnauthorized, "not signed in", "auth_unauthorized")
 		return
 	}
 	var req createSandboxRequest
@@ -83,7 +93,7 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.RepoURL == "" {
-		writeErr(w, http.StatusBadRequest, "repo_url is required")
+		writeErr(w, http.StatusBadRequest, "repo_url is required", "validation_missing_param")
 		return
 	}
 	info, err := git.ParseGitHubURL(req.RepoURL)
@@ -156,13 +166,13 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	repo, err := s.store.FindOrCreateRepository(user.ID, info.CloneURL, info.DefaultBranch)
 	if err != nil {
 		s.logger.Warn("repository lookup failed", slog.String("err", err.Error()))
-		writeErr(w, http.StatusInternalServerError, "could not store repository")
+		writeErr(w, http.StatusInternalServerError, "could not store repository", "store_repository_failed")
 		return
 	}
 
 	subdomain, err := s.uniqueSubdomain(info.Name)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not allocate subdomain")
+		writeErr(w, http.StatusInternalServerError, "could not allocate subdomain", "allocate_subdomain_failed")
 		return
 	}
 
@@ -190,7 +200,7 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.logger.Warn("sandbox create failed", slog.String("err", err.Error()))
-		writeErr(w, http.StatusInternalServerError, "could not create sandbox")
+		writeErr(w, http.StatusInternalServerError, "could not create sandbox", "create_sandbox_failed")
 		return
 	}
 
@@ -198,7 +208,7 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	// every required setting is present.
 	if err := s.replaceEnv(sandbox.ID, mergedEnv); err != nil {
 		s.logger.Warn("create: storing env vars", slog.String("sandbox", sandbox.ID), slog.String("err", err.Error()))
-		writeErr(w, http.StatusInternalServerError, "Sandbox was created but its settings could not be saved. Destroy it and try again.")
+		writeErr(w, http.StatusInternalServerError, "Sandbox was created but its settings could not be saved. Destroy it and try again.", "create_sandbox_settings_failed")
 		return
 	}
 
@@ -273,12 +283,12 @@ func (s *Server) authorizeSandboxAccess(r *http.Request) (*db.Sandbox, error) {
 // authorizeSandboxAccess: it writes the error response and reports ok=false.
 func (s *Server) requireOwnedSandbox(w http.ResponseWriter, r *http.Request) (*db.Sandbox, bool) {
 	if _, ok := s.userFrom(r); !ok {
-		writeErr(w, http.StatusUnauthorized, "not signed in")
+		writeErr(w, http.StatusUnauthorized, "not signed in", "auth_unauthorized")
 		return nil, false
 	}
 	sb, err := s.authorizeSandboxAccess(r)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "sandbox not found")
+		writeErr(w, http.StatusNotFound, "sandbox not found", "sandbox_not_found")
 		return nil, false
 	}
 	return sb, true
@@ -397,4 +407,95 @@ func warningMessage(threshold string, remaining time.Duration) string {
 		}
 		return fmt.Sprintf("This sandbox will be permanently deleted in about %dm. There is no undo — extend it now if you still need it.", m)
 	}
+}
+
+// handleContainers returns the container status for a sandbox.
+// GET /api/sandboxes/{id}/containers?container=app|postgres|mysql|redis
+func (s *Server) handleContainers(w http.ResponseWriter, r *http.Request) {
+	ws, sb := s.upgrade(w, r)
+	if ws == nil {
+		return
+	}
+	defer ws.shutdown()
+
+	if reason := unavailableReason(sb); reason != "" {
+		ws.sendTerminal(wsEvent{Type: "unavailable", Reason: reason})
+		return
+	}
+
+	// Determine which containers to show based on ?container query param.
+	containerName := r.URL.Query().Get("container")
+	validNames := []string{"app"}
+	if svc, err := servicesFromJSON(json.RawMessage(sb.ServicesOverride), "", analyze.Services{}); err == nil {
+		if svc.Postgres {
+			validNames = append(validNames, "postgres")
+		}
+		if svc.MySQL {
+			validNames = append(validNames, "mysql")
+		}
+		if svc.Redis {
+			validNames = append(validNames, "redis")
+		}
+	}
+
+	// If a specific container was requested, validate it.
+	if containerName != "" && !contains(validNames, containerName) {
+		writeErr(w, http.StatusBadRequest,
+			fmt.Sprintf("container must be one of %v", validNames))
+		return
+	}
+
+	// Helper to get status string.
+	statusStr := func() string {
+		switch sb.Status {
+		case db.StatusRunning:
+			return "running"
+		case db.StatusHibernated:
+			return "exited"
+		case db.StatusFailed:
+			return "exited"
+		case db.StatusExpired:
+			return "exited"
+		case db.StatusDeleted:
+			return "exited"
+		default:
+			return "none"
+		}
+	}()
+
+	// Helper to get health string.
+	healthStr := func() string {
+		if sb.ContainerID != "" && sb.Status == db.StatusRunning {
+			return "healthy"
+		}
+		return "unhealthy"
+	}()
+
+	// Build the container list.
+	containers := []map[string]any{
+		{"name": "app", "status": statusStr, "health": healthStr},
+	}
+
+	// Add postgres/mysql/redis if the sandbox has those services.
+	serviceNames := []string{}
+	if svc, err := servicesFromJSON(json.RawMessage(sb.ServicesOverride), "", analyze.Services{}); err == nil {
+		if svc.Postgres {
+			serviceNames = append(serviceNames, "postgres")
+		}
+		if svc.MySQL {
+			serviceNames = append(serviceNames, "mysql")
+		}
+		if svc.Redis {
+			serviceNames = append(serviceNames, "redis")
+		}
+	}
+	for _, cn := range serviceNames {
+		containers = append(containers, map[string]any{
+			"name":  cn,
+			"status": statusStr,
+			"health": healthStr,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"containers": containers})
 }

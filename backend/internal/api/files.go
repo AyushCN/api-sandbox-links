@@ -84,7 +84,7 @@ func (s *Server) handleFileContent(w http.ResponseWriter, r *http.Request) {
 	}
 	root, err := s.sandboxRoot(sb.ID)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "working directory not found")
+		writeErr(w, http.StatusNotFound, "working directory not found", "working_dir_not_found_2")
 		return
 	}
 	rel := r.URL.Query().Get("path")
@@ -128,7 +128,7 @@ var redeployLocks sync.Map
 func (s *Server) handleSaveFile(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.userFrom(r)
 	if !ok {
-		writeErr(w, http.StatusUnauthorized, "not signed in")
+		writeErr(w, http.StatusUnauthorized, "not signed in", "auth_unauthorized")
 		return
 	}
 	sb, ok := s.requireOwnedSandbox(w, r)
@@ -136,13 +136,13 @@ func (s *Server) handleSaveFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if sb.DestroyedAt != nil {
-		writeErr(w, http.StatusConflict, "sandbox is destroyed; nothing to edit")
+		writeErr(w, http.StatusConflict, "sandbox is destroyed; nothing to edit", "nothing_to_edit")
 		return
 	}
 	var req saveFileRequest
 	r.Body = http.MaxBytesReader(w, r.Body, 2*maxFileBytes)
 	if err := decodeJSON(r, &req); err != nil || req.Path == "" {
-		writeErr(w, http.StatusBadRequest, "path is required")
+		writeErr(w, http.StatusBadRequest, "path is required", "validation_missing_param")
 		return
 	}
 
@@ -152,7 +152,7 @@ func (s *Server) handleSaveFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.HasPrefix(filepath.Clean(req.Path), ".git") {
-		writeErr(w, http.StatusBadRequest, "git internals are not editable")
+		writeErr(w, http.StatusBadRequest, "git internals are not editable", "git_editable")
 		return
 	}
 
@@ -160,7 +160,7 @@ func (s *Server) handleSaveFile(w http.ResponseWriter, r *http.Request) {
 	if req.IsBase64 {
 		data, err = base64.StdEncoding.DecodeString(req.Content)
 		if err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid base64 content")
+			writeErr(w, http.StatusBadRequest, "invalid base64 content", "invalid_base64")
 			return
 		}
 	} else {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -167,4 +168,61 @@ func TestRecreateWithoutBodyUsesParentLifetime(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("recreated sandbox was never handed to the deployer")
 	}
+}
+
+func TestRecreateInvalidLifetime(t *testing.T) {
+	s, gdb, srv, box := authedServer(t)
+	parent := e2eSandbox(t, s, gdb, "recreate-lifetime", 329, "sleep 30")
+	cookie := sealedCookie(t, box, 329)
+
+	// Mark parent as destroyed so we can recreate
+	now := time.Now().UTC()
+	if err := gdb.Model(&db.Sandbox{}).Where("id = ?", parent.ID).Updates(map[string]any{
+		"status":             string(db.StatusExpired),
+		"destroyed_at":       now,
+		"destruction_reason": string(db.DestroyLifetimeExpired),
+		"container_id":       "",
+	}).Error; err != nil {
+		t.Fatalf("marking parent expired: %v", err)
+	}
+
+	// Test with lifetime too low (below MinLifetimeSeconds = 3600)
+	resp, data := authedRequest(t, srv, http.MethodPost,
+		"/api/sandboxes/"+parent.ID+"/actions/recreate", `{"lifetime_seconds":100}`, cookie)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("recreate low lifetime status = %d, want 400 (body %s)", resp.StatusCode, data)
+	}
+	errMsg := string(data)
+	if !strings.Contains(errMsg, "lifetime_seconds must be between") {
+		t.Fatalf("recreate low lifetime body %q does not contain expected error", errMsg)
+	}
+
+	// Test with lifetime too high (above maxLifetime)
+	resp, data = authedRequest(t, srv, http.MethodPost,
+		"/api/sandboxes/"+parent.ID+"/actions/recreate", `{"lifetime_seconds":999999}`, cookie)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("recreate high lifetime status = %d, want 400 (body %s)", resp.StatusCode, data)
+	}
+	errMsg = string(data)
+	if !strings.Contains(errMsg, "lifetime_seconds must be between") {
+		t.Fatalf("recreate high lifetime body %q does not contain expected error", errMsg)
+	}
+
+	// Test with no body (should use parent's lifetime)
+	resp, data = authedRequest(t, srv, http.MethodPost,
+		"/api/sandboxes/"+parent.ID+"/actions/recreate", "", cookie)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("recreate no body status = %d, want 202 (body %s)", resp.StatusCode, data)
+	}
+	var got struct {
+		ID              string `json:"id"`
+		LifetimeSeconds int64  `json:"lifetime_seconds"`
+	}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	if got.LifetimeSeconds != parent.LifetimeSeconds {
+		t.Errorf("lifetime_seconds = %d, want parent lifetime %d", got.LifetimeSeconds, parent.LifetimeSeconds)
+	}
+	t.Cleanup(func() { gdb.Exec("DELETE FROM sandboxes WHERE id = ?", got.ID) })
 }

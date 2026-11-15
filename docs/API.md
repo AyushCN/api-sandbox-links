@@ -16,12 +16,94 @@ authorize.
 
 Conventions:
 
-- JSON in/out. Errors are `{ "error": "<message>" }` with an appropriate status.
+- JSON in/out. Errors are `{ "error": "<message>", "error_code": "<code>" }`
+  with an appropriate status.
 - Statuses: `200` ok, `201` created, `202` accepted, `400` validation, `401`
   auth, `404` missing, `409` conflict, `501`/`502` upstream.
 - The container's actual listening port is **discovered** at deploy time, so
   `internal_port` may differ from the nixpacks-detected port (apps that hardcode
   a port, e.g. Go apps on 8080). See ARCHITECTURE.md.
+
+## Error codes
+
+The following machine-readable error codes are returned with every JSON error response:
+
+| Code | Meaning |
+|---|---|
+| `auth_unauthorized` | Not signed in / invalid session |
+| `validation_missing_param` | Required parameter missing |
+| `validation_invalid_repo_url` | Invalid GitHub repository URL |
+| `validation_invalid_services` | Invalid services selection |
+| `validation_invalid_range` | Invalid range parameter (must be 1h, 6h, 24h, or 7d) |
+| `validation_positive` | Parameter must be positive (e.g. additional_seconds) |
+| `validation_range` | Parameter out of valid range (e.g. idle_timeout_seconds 600-86400) |
+| `sandbox_destroyed` | Sandbox has been destroyed |
+| `sandbox_destroyed_cannot_edit` | Cannot edit a destroyed sandbox |
+| `only_destroyed_recreate` | Only destroyed sandboxes can be recreated (try recreate instead) |
+| `only_stop_destroyed` | Cannot stop a destroyed sandbox |
+| `only_start_destroyed` | Cannot start a destroyed sandbox |
+| `only_running_stop` | Only running sandboxes can be stopped |
+| `only_hibernated_start` | Only hibernated sandboxes can be started |
+| `analysis_failed` | Analysis of the repository failed |
+| `deploy_list_failed` | Could not list deployments |
+| `lifetime_extend_failed` | Could not extend lifetime |
+| `nothing_to_commit` | Nothing to commit (no changes) |
+| `no_changes_to_commit` | No changes in the sandbox working directory |
+| `load_repository_failed` | Could not load the repository |
+| `read_repository_url_failed` | Could not read the repository URL |
+| `read_settings_failed` | Could not read the previous sandbox settings |
+| `allocate_subdomain_failed` | Could not allocate subdomain |
+| `recreate_failed` | Could not recreate sandbox |
+| `recreate_settings_failed` | Could not copy settings during recreation |
+| `commit_failed` | Could not commit changes |
+| `read_github_creds_failed` | Could not read GitHub credentials |
+| `list_sandboxes_failed` | Could not list sandboxes |
+| `store_repository_failed` | Could not store repository |
+| `create_sandbox_failed` | Could not create sandbox |
+| `create_sandbox_settings_failed` | Could not save sandbox settings during creation |
+| `working_dir_not_found` | Working directory not found (sandbox building or destroyed) |
+| `working_dir_building` | Working directory still building |
+| `working_dir_not_found_2` | Working directory not found |
+| `git_editable` | Git internals are not editable |
+| `read_existing_settings_failed` | Could not read existing settings |
+| `save_settings_failed` | Could not save settings |
+| `load_parent_repo_failed` | Could not load the parent repository |
+| `read_parent_repo_url_failed` | Could not read the parent repository URL |
+| `create_fork_failed` | Could not create fork |
+| `copy_fork_settings_failed` | Could not copy fork settings |
+| `sandbox_destroyed_cannot_edit` | This sandbox has been destroyed and cannot be edited |
+| `read_warnings_failed` | Could not read warnings |
+| `query_history_failed` | Could not query resource history |
+
+Dynamic errors (those containing `err.Error()`) may not have a static error code.
+
+## Sandbox object
+
+Every endpoint that returns a sandbox uses this shape (keys from `sandboxJSON`):
+
+```jsonc
+{
+  "id": "6a90fec3-8aad-4024-b83e-1cb76d867c9f",
+  "subdomain": "node-js-sample-7e9fd5",
+  "url": "http://node-js-sample-7e9fd5.sandbox.localhost",
+  "status": "running",                 // queued|building|running|hibernated|failed|expired|deleted
+  "branch": "master",
+  "parent_sandbox_id": null,           // set on forks
+  "container_id": "…",
+  "internal_port": 3000,
+  "idle_timeout_seconds": 900,
+  "last_request_at": "…",
+  "lifetime_seconds": 86400,
+  "activated_at": null,                 // set when the sandbox first goes live
+  "expires_at": "…",
+  "destroyed_at": null,                // tombstone when destroyed
+  "destruction_reason": null,          // lifetime_expired|user_requested
+  "detected_language": "nodejs",
+  "build_config": { "provider": "node", "port": 3000, "start": "…" },
+  "created_at": "…",
+  "updated_at": "…"
+}
+```
 
 ## Sandbox object
 

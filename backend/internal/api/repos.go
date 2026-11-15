@@ -26,7 +26,7 @@ type analyzeRepoRequest struct {
 func (s *Server) handleAnalyzeRepo(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.userFrom(r)
 	if !ok {
-		writeErr(w, http.StatusUnauthorized, "not signed in")
+		writeErr(w, http.StatusUnauthorized, "not signed in", "auth_unauthorized")
 		return
 	}
 	if wait, ok := s.ratelim.allow(user.ID); !ok {
@@ -39,12 +39,12 @@ func (s *Server) handleAnalyzeRepo(w http.ResponseWriter, r *http.Request) {
 
 	var req analyzeRepoRequest
 	if err := decodeJSON(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "Send a JSON body with a repo_url.")
+		writeErr(w, http.StatusBadRequest, "Send a JSON body with a repo_url.", "validation_missing_param")
 		return
 	}
 	info, err := git.ParseGitHubURL(req.RepoURL)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "That is not a GitHub repository URL. Use https://github.com/owner/repo.")
+		writeErr(w, http.StatusBadRequest, "That is not a GitHub repository URL. Use https://github.com/owner/repo.", "validation_invalid_repo_url")
 		return
 	}
 

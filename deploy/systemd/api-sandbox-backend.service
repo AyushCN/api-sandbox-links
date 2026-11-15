@@ -1,0 +1,27 @@
+[Unit]
+Description=API Sandbox Links backend
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=sandbox
+Group=sandbox
+SupplementaryGroups=docker
+WorkingDirectory=/opt/api-sandbox
+EnvironmentFile=/etc/api-sandbox/backend.env
+ExecStart=/opt/api-sandbox/server
+Restart=always
+RestartSec=3
+TimeoutStopSec=25
+KillMode=mixed
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/api-sandbox
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
