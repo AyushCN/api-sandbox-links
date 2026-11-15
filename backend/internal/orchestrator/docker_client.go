@@ -102,9 +102,3 @@ func volumeCreate(name, sandboxID string) volume.CreateOptions {
 func newID() string {
 	return uuid.NewString()
 }
-
-// Ping verifies the Docker daemon is reachable; used by readiness and doctor.
-func (o *Orchestrator) Ping(ctx context.Context) error {
-	_, err := o.docker.Ping(ctx)
-	return err
-}

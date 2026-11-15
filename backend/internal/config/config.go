@@ -60,6 +60,22 @@ type Config struct {
 	// BuildKitHost is the endpoint for BuildKit (e.g. unix:///var/run/buildkit/buildkitd.sock).
 	BuildKitHost string
 
+	// AppEnv is the current environment (development, staging, production).
+	AppEnv string
+
+	// BuildMode is the deployment mode (host-docker, nixpacks, railpack).
+	// Production requires host-docker; development can use nixpacks/railpack.
+	BuildMode string
+
+	// ImagePruneHours controls how many hours of unused images to prune.
+	// Default 0 means prune is disabled; set to a positive number like 24 to
+	// automatically remove images not used within that many hours.
+	ImagePruneHours int
+
+	// DiskMinFreeGB minimum disk free space (in GB) required for sandbox operation.
+	// Sandboxes will be marked unhealthy if free space falls below this threshold.
+	DiskMinFreeGB int
+
 	// DevAuth, when true (default if GITHUB_CLIENT_ID is unset), lets requests
 	// authenticate with a fake GitHub identity so the deploy loop is testable
 	// without OAuth round-trips.
@@ -136,6 +152,10 @@ func Load() (*Config, error) {
 		GatewayRateLimitBurst:     envIntDefault("GATEWAY_RATE_LIMIT_BURST", 200),
 		GatewayMaxBodyBytes:       envInt64Default("GATEWAY_MAX_BODY_BYTES", 32*1024*1024),
 		DevAuth:                   os.Getenv("GITHUB_CLIENT_ID") == "",
+		AppEnv:                    os.Getenv("APP_ENV"),
+		BuildMode:               os.Getenv("BUILD_MODE"),
+		ImagePruneHours:         envIntDefault("IMAGE_PRUNE_HOURS", 0),
+		DiskMinFreeGB:           envIntDefault("DISK_MIN_FREE_GB", 10),
 	}
 
 	if err := cfg.decryptKey(); err != nil {

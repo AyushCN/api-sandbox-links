@@ -247,13 +247,7 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 	if startCommand == "" {
 		startCommand = strings.TrimSpace(plan.StartCmd)
 	}
-	project := analyze.DetectProject(workDir)
-	imageTag, err := d.orch.BuildImage(ctx, workDir, "sandbox-"+sandbox.Subdomain, buildLog, BuildOptions{
-		StartCommand:    startCommand,
-		Language:        project.Language,
-		Framework:       project.Framework,
-		LanguageVersion: project.Version,
-	})
+	imageTag, err := d.orch.BuildImage(ctx, workDir, "sandbox-"+sandbox.Subdomain, buildLog)
 	if err != nil {
 		// Push build log lines to Redis on failure
 		_ = d.cache.AppendBuildLogBatch(ctx, sandbox.ID, buildLog.String())
