@@ -80,6 +80,11 @@ func (r *Redis) Clear(ctx context.Context, sandboxID string) error {
 	return r.client.Del(ctx, lastRequestKey(sandboxID)).Err()
 }
 
+// ClearLatestStat removes the sandbox's latest sample from Redis during teardown.
+func (r *Redis) ClearLatestStat(ctx context.Context, sandboxID string) error {
+	return r.client.Del(ctx, latestStatKey(sandboxID)).Err()
+}
+
 // ---- latest live resource sample (resource dashboard) -------------------
 //
 // The stats collector overwrites one key per sandbox on every sample, and the

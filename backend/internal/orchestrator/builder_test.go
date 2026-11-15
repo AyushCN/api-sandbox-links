@@ -69,9 +69,22 @@ func TestNewBuilderFactory(t *testing.T) {
 		}
 	})
 
-	t.Run("unsupported builder", func(t *testing.T) {
+	t.Run("dockerfile builder initialization", func(t *testing.T) {
 		cfg := &config.Config{
 			Builder: "dockerfile",
+		}
+		b, err := NewBuilder(cfg, logger)
+		if err != nil {
+			t.Fatalf("unexpected error creating dockerfile builder: %v", err)
+		}
+		if b.Name() != "dockerfile" {
+			t.Errorf("expected builder name 'dockerfile', got %q", b.Name())
+		}
+	})
+
+	t.Run("unsupported builder", func(t *testing.T) {
+		cfg := &config.Config{
+			Builder: "unsupported_engine",
 		}
 		if _, err := NewBuilder(cfg, logger); err == nil {
 			t.Error("expected error for unsupported builder engine")
@@ -490,7 +503,7 @@ func TestBuilderFallbackAndRejection(t *testing.T) {
 	logger := slog.Default()
 
 	t.Run("unsupported builders rejected with clear error", func(t *testing.T) {
-		unsupported := []string{"dockerfile", "pack", "buildpacks", "kaniko", "invalid"}
+		unsupported := []string{"pack", "buildpacks", "kaniko", "invalid"}
 		for _, name := range unsupported {
 			cfg := &config.Config{Builder: name}
 			_, err := NewBuilder(cfg, logger)

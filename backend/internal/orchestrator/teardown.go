@@ -125,6 +125,11 @@ func (o *Orchestrator) TeardownSandbox(ctx context.Context, sandbox *db.Sandbox)
 		o.logger.Warn("teardown: deleting resource snapshots",
 			slog.String("sandbox", sandbox.ID), slog.String("err", err.Error()))
 	}
+
+	if o.cache != nil {
+		_ = o.cache.Clear(ctx, sandbox.ID)
+		_ = o.cache.ClearLatestStat(ctx, sandbox.ID)
+	}
 	return nil
 }
 

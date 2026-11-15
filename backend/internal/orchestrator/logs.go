@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strconv"
 	"sync"
 
 	"github.com/docker/docker/api/types/container"
@@ -290,4 +291,30 @@ func shortContainerID(id string) string {
 		return id[:12]
 	}
 	return id
+}
+
+// GetRecentContainerLogs reads the most recent tail lines from the container's stdout and stderr.
+func (o *Orchestrator) GetRecentContainerLogs(ctx context.Context, containerID string, tail int) (string, error) {
+	if containerID == "" {
+		return "", errors.New("empty container id")
+	}
+	if tail <= 0 {
+		tail = 100
+	}
+	opts := container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Timestamps: false,
+		Follow:     false,
+		Tail:       strconv.Itoa(tail),
+	}
+	rc, err := o.docker.ContainerLogs(ctx, containerID, opts)
+	if err != nil {
+		return "", fmt.Errorf("orchestrator: reading container logs: %w", err)
+	}
+	defer rc.Close()
+
+	var buf bytes.Buffer
+	_, _ = stdcopy.StdCopy(&buf, &buf, rc)
+	return buf.String(), nil
 }

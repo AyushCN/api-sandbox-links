@@ -18,6 +18,7 @@ import (
 	"github.com/api-sandbox-links/backend/internal/orchestrator"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"gorm.io/datatypes"
 )
 
 // Lifetime constants shared with the frontend's picker.
@@ -33,12 +34,13 @@ const (
 
 // createSandboxRequest is the body of POST /api/sandboxes.
 type createSandboxRequest struct {
-	RepoURL            string            `json:"repo_url"`
-	Branch             string            `json:"branch"`
-	LifetimeSeconds    int64             `json:"lifetime_seconds"`
-	IdleTimeoutSeconds int               `json:"idle_timeout_seconds"`
-	Database           string            `json:"database"` // auto | postgres | mysql | none
-	EnvVars            map[string]string `json:"env_vars"`
+	RepoURL            string                        `json:"repo_url"`
+	Branch             string                        `json:"branch"`
+	LifetimeSeconds    int64                         `json:"lifetime_seconds"`
+	IdleTimeoutSeconds int                           `json:"idle_timeout_seconds"`
+	Database           string                        `json:"database"` // auto | postgres | mysql | none
+	EnvVars            map[string]string             `json:"env_vars"`
+	BuildConfig        *orchestrator.UserBuildConfig `json:"build_config"`
 }
 
 // handleListSandboxes returns the signed-in user's sandboxes, newest first.
@@ -121,6 +123,12 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now()
+	var initialBuildConfig datatypes.JSON
+	if req.BuildConfig != nil {
+		if b, err := json.Marshal(req.BuildConfig); err == nil {
+			initialBuildConfig = datatypes.JSON(b)
+		}
+	}
 	sandbox := &db.Sandbox{
 		ID:                 uuid.NewString(),
 		RepositoryID:       repo.ID,
@@ -131,6 +139,7 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		LifetimeSeconds:    lifetime,
 		ExpiresAt:          now.Add(time.Duration(lifetime) * time.Second),
 		CreatedAt:          now,
+		BuildConfig:        initialBuildConfig,
 	}
 	if err := s.store.CreateSandboxWithinLimits(sandbox, user.ID, s.maxActiveSandboxes(), s.maxRunningSandboxes()); err != nil {
 		if errors.Is(err, db.ErrSandboxQuotaExceeded) {
@@ -156,7 +165,11 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Deploy asynchronously; the client polls the sandbox until running.
-	opts := orchestrator.DeployOptions{Trigger: db.TriggerInitial, DatabaseOverride: req.Database}
+	opts := orchestrator.DeployOptions{
+		Trigger:          db.TriggerInitial,
+		DatabaseOverride: req.Database,
+		UserBuildConfig:  req.BuildConfig,
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), orchestrator.DeployTimeout)
 		defer cancel()
@@ -232,15 +245,29 @@ func (s *Server) requireOwnedSandbox(w http.ResponseWriter, r *http.Request) (*d
 
 // sandboxJSON renders a sandbox row plus computed fields the UI needs.
 func (s *Server) sandboxJSON(sb *db.Sandbox) map[string]any {
+	var dbEngine string
+	if s.store != nil {
+		if dbs, err := s.store.ListSandboxDatabases(sb.ID); err == nil && len(dbs) > 0 {
+			dbEngine = dbs[0].Engine
+		}
+	}
+
+	sandboxURL := "http://" + sb.Subdomain + "." + s.cfg.SandboxBaseDomain
+	if s.cfg.GatewayPort != 80 && s.cfg.GatewayPort != 443 && s.cfg.GatewayPort > 0 {
+		sandboxURL += fmt.Sprintf(":%d", s.cfg.GatewayPort)
+	}
+
 	return map[string]any{
 		"id":                   sb.ID,
 		"subdomain":            sb.Subdomain,
-		"url":                  "http://" + sb.Subdomain + "." + s.cfg.SandboxBaseDomain,
+		"url":                  sandboxURL,
 		"status":               sb.Status,
 		"branch":               sb.BranchName,
+		"githubBranch":         sb.BranchName,
 		"parent_sandbox_id":    sb.ParentSandboxID,
 		"container_id":         sb.ContainerID,
 		"internal_port":        sb.InternalPort,
+		"database_engine":      dbEngine,
 		"idle_timeout_seconds": sb.IdleTimeoutSeconds,
 		"last_request_at":      sb.LastRequestAt,
 		"lifetime_seconds":     sb.LifetimeSeconds,

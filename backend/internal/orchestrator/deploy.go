@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/api-sandbox-links/backend/internal/cache"
@@ -42,6 +43,9 @@ type Deployer struct {
 	// buildSem limits how many clones/builds/container starts run at once.
 	// Nil means unlimited; only direct Deployer construction in tests omits it.
 	buildSem chan struct{}
+
+	cancelsMu     sync.Mutex
+	activeCancels map[string]context.CancelFunc
 }
 
 // NewDeployer builds the deploy coordinator.
@@ -51,8 +55,42 @@ func NewDeployer(cfg *config.Config, store *db.Store, orch *Orchestrator, box *s
 		concurrency = defaultBuildConcurrency
 	}
 	return &Deployer{
-		cfg: cfg, store: store, orch: orch, box: box, cache: cache,
-		buildSem: make(chan struct{}, concurrency),
+		cfg:           cfg,
+		store:         store,
+		orch:          orch,
+		box:           box,
+		cache:         cache,
+		buildSem:      make(chan struct{}, concurrency),
+		activeCancels: make(map[string]context.CancelFunc),
+	}
+}
+
+func (d *Deployer) registerCancel(sandboxID string, cancel context.CancelFunc) {
+	d.cancelsMu.Lock()
+	defer d.cancelsMu.Unlock()
+	if d.activeCancels == nil {
+		d.activeCancels = make(map[string]context.CancelFunc)
+	}
+	d.activeCancels[sandboxID] = cancel
+}
+
+func (d *Deployer) unregisterCancel(sandboxID string) {
+	d.cancelsMu.Lock()
+	defer d.cancelsMu.Unlock()
+	if d.activeCancels != nil {
+		delete(d.activeCancels, sandboxID)
+	}
+}
+
+// CancelDeploy terminates an active in-flight build/deploy context for sandboxID.
+func (d *Deployer) CancelDeploy(sandboxID string) {
+	d.cancelsMu.Lock()
+	defer d.cancelsMu.Unlock()
+	if d.activeCancels != nil {
+		if cancel, ok := d.activeCancels[sandboxID]; ok {
+			cancel()
+			delete(d.activeCancels, sandboxID)
+		}
 	}
 }
 
@@ -100,6 +138,8 @@ type DeployOptions struct {
 	// DatabaseOverride forces a sidecar engine ("postgres"/"mysql"/"none") or
 	// leaves "auto" to repository detection.
 	DatabaseOverride string
+	// UserBuildConfig optionally supplies explicit build configuration.
+	UserBuildConfig *UserBuildConfig
 }
 
 // DeploySandbox deploys (or redeploys) the given sandbox and records progress
@@ -115,6 +155,11 @@ type DeployOptions struct {
 //  5. turn off any previous container for this sandbox,
 //  6. run the new container on the private network with limits + labels.
 func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts DeployOptions) error {
+	deployCtx, cancelDeploy := context.WithCancel(ctx)
+	defer cancelDeploy()
+	d.registerCancel(sandbox.ID, cancelDeploy)
+	defer d.unregisterCancel(sandbox.ID)
+
 	// Reload sandbox instead of creating new one, if it existed before
 	fresh, err := d.store.GetSandbox(sandbox.ID)
 	if err != nil {
@@ -183,6 +228,11 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 			d.orch.logger.Info("deploy: failed build on destroyed sandbox; removed work dir",
 				slog.String("sandbox", sandbox.ID))
 		}
+		// Do not flip status back to failed if the sandbox was already destroyed/deleted.
+		latest, errLatest := d.store.GetSandbox(sandbox.ID)
+		if errLatest == nil && (latest.DestroyedAt != nil || latest.Status == db.StatusDeleted) {
+			return cause
+		}
 		_ = d.store.UpdateSandbox(sandbox.ID, map[string]any{
 			"status": string(db.StatusFailed),
 		})
@@ -195,7 +245,7 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 	if err := d.store.UpdateSandbox(sandbox.ID, map[string]any{"status": string(db.StatusQueued)}); err != nil {
 		return err
 	}
-	release, err := d.acquireBuildSlot(ctx)
+	release, err := d.acquireBuildSlot(deployCtx)
 	if err != nil {
 		return markFailed(fmt.Errorf("deploy: waiting for build slot: %w", err))
 	}
@@ -220,7 +270,7 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 		if err != nil {
 			return markFailed(fmt.Errorf("deploy: loading repository: %w", err))
 		}
-		if _, err := git.Clone(ctx, repo.GithubURL, sandbox.BranchName, workDir); err != nil {
+		if _, err := git.Clone(deployCtx, repo.GithubURL, sandbox.BranchName, workDir); err != nil {
 			// remove partial clone
 			if rmErr := RemoveSandboxWorkDir(d.cfg.SandboxWorkDir, sandbox.Subdomain); rmErr != nil {
 				d.orch.logger.Warn("deploy: removing partial clone after failure",
@@ -236,9 +286,38 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 
 	// Phase H: sidecar database. Detection reads the freshly-cloned files; an
 	// explicit override wins over auto-detection.
-	if err := d.maybeProvisionDatabase(ctx, sandbox, opts.DatabaseOverride, workDir); err != nil {
+	if err := d.maybeProvisionDatabase(deployCtx, sandbox, opts.DatabaseOverride, workDir); err != nil {
 		return markFailed(fmt.Errorf("deploy: provisioning sidecar database: %w", err))
 	}
+
+	// 1. Resolve explicit or stored user build options
+	var userCfg *UserBuildConfig
+	if opts.UserBuildConfig != nil {
+		userCfg = opts.UserBuildConfig
+	} else if len(sandbox.BuildConfig) > 0 {
+		var stored UserBuildConfig
+		if err := json.Unmarshal([]byte(sandbox.BuildConfig), &stored); err == nil {
+			userCfg = &stored
+		}
+	}
+
+	// 2. Deterministic builder selection
+	builderResolver := NewBuilderResolver(d.cfg, d.orch.logger)
+	builder, err := builderResolver.ResolveBuilder(workDir, userCfg)
+	if err != nil {
+		return markFailed(fmt.Errorf("builder selection: %w", err))
+	}
+	builderName = builder.Name()
+
+	// 3. Resolve normalized build configuration
+	configResolver := NewBuildConfigResolver(d.cfg, d.orch.logger)
+	resolvedConfig, err := configResolver.Resolve(deployCtx, builder, workDir, userCfg)
+	if err != nil {
+		return markFailed(fmt.Errorf("build configuration: %w", err))
+	}
+
+	// Update deployment record with true resolved builder
+	_ = d.store.UpdateDeployment(deploy.ID, map[string]any{"builder": builderName})
 
 	buildLog := &bytes.Buffer{}
 	if builderName == "nixpacks" {
@@ -247,14 +326,16 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 			slog.String("recommendation", "configure BUILDER=railpack"))
 		buildLog.WriteString("================================================================================\nDEPRECATION WARNING: Nixpacks is deprecated and will be removed in a future release.\nConfigure BUILDER=railpack to use the recommended builder.\n================================================================================\n\n")
 	}
-	plan, err := d.orch.PlanAnalyze(ctx, workDir)
-	if err != nil {
-		return markFailed(err)
-	}
-	port := plan.InternalPort
+
+	port := resolvedConfig.Port
 
 	buildStart := time.Now()
-	imageTag, err := d.orch.BuildImage(ctx, workDir, "sandbox-"+sandbox.Subdomain, buildLog)
+	var imageTag string
+	if rp, ok := builder.(*RailpackBuilder); ok {
+		imageTag, err = rp.BuildImageWithConfig(deployCtx, resolvedConfig.RootDir, "sandbox-"+sandbox.Subdomain, resolvedConfig, buildLog)
+	} else {
+		imageTag, err = builder.BuildImage(deployCtx, resolvedConfig.RootDir, "sandbox-"+sandbox.Subdomain, buildLog)
+	}
 	buildDurationMs := time.Since(buildStart).Milliseconds()
 	if err != nil {
 		return markFailed(err, buildLog.String(), buildDurationMs)
@@ -262,7 +343,7 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 
 	// Inspect image size on successful build
 	var imageSizeBytes *int64
-	if size, sizeErr := d.orch.ImageSizeBytes(ctx, imageTag); sizeErr == nil && size > 0 {
+	if size, sizeErr := d.orch.ImageSizeBytes(deployCtx, imageTag); sizeErr == nil && size > 0 {
 		imageSizeBytes = &size
 	} else if sizeErr != nil {
 		d.orch.logger.Debug("deploy: inspecting image size", slog.String("image", imageTag), slog.String("err", sizeErr.Error()))
@@ -274,14 +355,19 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 	// Shut down and remove any previous container so the new image takes over.
 	// Sidecar DB containers are untouched — only the app container is replaced.
 	if sandbox.ContainerID != "" {
-		if err := d.replaceAppContainer(ctx, sandbox.ID, sandbox.ContainerID); err != nil {
+		if err := d.replaceAppContainer(deployCtx, sandbox.ID, sandbox.ContainerID); err != nil {
 			return markFailed(fmt.Errorf("deploy: replacing old container: %w", err))
 		}
 	}
 
-	envs, err := d.buildEnv(ctx, sandbox, port)
+	envs, err := d.buildEnv(deployCtx, sandbox, port)
 	if err != nil {
 		return markFailed(err)
+	}
+
+	var startCommand []string
+	if !resolvedConfig.PreserveCmd && strings.TrimSpace(resolvedConfig.StartCmd) != "" {
+		startCommand = []string{"sh", "-c", resolvedConfig.StartCmd}
 	}
 
 	runOpts := RunOptions{
@@ -292,8 +378,9 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 		Env:          envs,
 		NetworkName:  netName(sandbox.ID),
 		Labels:       map[string]string{"api-sandbox-links.service": "app"},
+		Command:      startCommand,
 	}
-	result, err := d.orch.RunSandbox(ctx, runOpts)
+	result, err := d.orch.RunSandbox(deployCtx, runOpts)
 	if err != nil {
 		return markFailed(err)
 	}
@@ -301,7 +388,7 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 	// The nixpacks-detected port can be wrong when an app hardcodes its own
 	// port instead of honoring PORT. Discover the real listening port so the
 	// gateway routes to the right container port.
-	discovered, err := d.orch.DiscoverPort(ctx, result.IPAddress, result.Port, 90*time.Second)
+	discovered, err := d.orch.DiscoverPort(deployCtx, result.IPAddress, result.Port, 90*time.Second)
 	if err != nil {
 		return markFailed(fmt.Errorf("deploy: app not reachable on any known port: %w", err))
 	}
@@ -321,7 +408,7 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 		"container_id":      result.ContainerID,
 		"image_tag":         imageTag,
 		"internal_port":     result.Port,
-		"detected_language": plan.DetectedLanguage,
+		"detected_language": resolvedConfig.Language,
 	})
 	switch {
 	case errors.Is(err, db.ErrSandboxDestroyed):
@@ -331,7 +418,9 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 		// already deleted.
 		d.orch.logger.Warn("deploy: sandbox was destroyed while building; discarding the new container",
 			slog.String("sandbox", sandbox.ID), slog.String("container", result.ContainerID))
-		_ = d.orch.TeardownSandbox(ctx, sandbox)
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancelCleanup()
+		_ = d.orch.TeardownSandbox(cleanupCtx, sandbox)
 		// The deploy may have re-created the work directory after the destroy
 		// removed it (clone-then-destroy race); destroy it again so a deleted
 		// sandbox never leaves files behind. RemoveSandboxWorkDir validates
@@ -360,8 +449,8 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 	defer cancel()
 	_ = d.cache.Touch(touchCtx, sandbox.ID, sandbox.IdleTimeoutSeconds)
 
-	if plan.Builder != "" {
-		builderName = plan.Builder
+	if resolvedConfig.Builder != "" {
+		builderName = resolvedConfig.Builder
 	}
 
 	deployPatch := map[string]any{
@@ -381,11 +470,22 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 		d.orch.logger.Warn("deploy: finalizing deployment record", slog.String("err", err.Error()))
 	}
 	// Capture build metadata on the sandbox row for the UI/debugging.
+	var relDockerfilePath string
+	if resolvedConfig.DockerfilePath != "" {
+		if rel, err := filepath.Rel(workDir, resolvedConfig.DockerfilePath); err == nil && !strings.HasPrefix(rel, "..") {
+			relDockerfilePath = rel
+		} else {
+			relDockerfilePath = filepath.Base(resolvedConfig.DockerfilePath)
+		}
+	}
+
 	buildMeta, _ := json.Marshal(map[string]any{
-		"builder":  builderName,
-		"provider": plan.Provider,
-		"port":     plan.InternalPort,
-		"start":    plan.StartCmd,
+		"builder":         builderName,
+		"provider":        resolvedConfig.Language,
+		"port":            result.Port,
+		"start":           resolvedConfig.StartCmd,
+		"root_dir":        resolvedConfig.RelativeRootDir,
+		"dockerfile_path": relDockerfilePath,
 	})
 	_ = d.store.UpdateSandbox(sandbox.ID, map[string]any{"build_config": string(buildMeta)})
 
@@ -424,12 +524,18 @@ func (d *Deployer) maybeProvisionDatabase(ctx context.Context, sandbox *db.Sandb
 			slog.String("sandbox", sandbox.ID), slog.String("engine", engine))
 		return nil
 	}
-	_, connURL, err := d.orch.ProvisionDatabase(ctx, sandbox, engine)
+	row, connURL, err := d.orch.ProvisionDatabase(ctx, sandbox, engine)
 	if err != nil {
 		return err
 	}
 	d.orch.logger.Info("deploy: sidecar database provisioned",
 		slog.String("sandbox", sandbox.ID), slog.String("engine", engine))
+	waitCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+	if err := d.orch.WaitForDatabase(waitCtx, sandbox.ID, row.ContainerID, engine, 45*time.Second); err != nil {
+		d.orch.logger.Warn("deploy: database health check timeout; continuing",
+			slog.String("sandbox", sandbox.ID), slog.String("err", err.Error()))
+	}
 	_ = connURL
 	return nil
 }
@@ -504,6 +610,17 @@ func dbEnvFromURL(u string) map[string]string {
 		"PGUSER":     user,
 		"PGPASSWORD": pass,
 		"PGDATABASE": dbName,
+		// Standard MySQL and application environment variables
+		"DB_HOST":        host,
+		"DB_PORT":        port,
+		"DB_USER":        user,
+		"DB_PASSWORD":    pass,
+		"DB_NAME":        dbName,
+		"MYSQL_HOST":     host,
+		"MYSQL_PORT":     port,
+		"MYSQL_USER":     user,
+		"MYSQL_PASSWORD": pass,
+		"MYSQL_DATABASE": dbName,
 	}
 	for k, v := range generic {
 		if v == "" {
@@ -519,6 +636,9 @@ func dbEnvFromURL(u string) map[string]string {
 func (d *Deployer) replaceAppContainer(ctx context.Context, sandboxID, containerID string) error {
 	d.orch.StopStatsCollector(sandboxID)
 	if err := d.orch.RemoveContainer(ctx, containerID); err != nil {
+		if strings.Contains(err.Error(), "No such container") || strings.Contains(err.Error(), "not found") {
+			return nil
+		}
 		return err
 	}
 	return nil
@@ -549,7 +669,7 @@ func detectCacheHit(builder string, logs string) *bool {
 
 	lower := strings.ToLower(logs)
 	switch strings.ToLower(builder) {
-	case "railpack":
+	case "railpack", "dockerfile":
 		// BuildKit emits "=> CACHED [" or "[cached]" on cache hit
 		if strings.Contains(logs, "CACHED") || strings.Contains(lower, "[cached]") {
 			return &tVal

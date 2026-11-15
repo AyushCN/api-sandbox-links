@@ -2,9 +2,11 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/api-sandbox-links/backend/internal/db"
@@ -95,14 +97,23 @@ func (s *Server) handleExtendLifetime(w http.ResponseWriter, r *http.Request) {
 // handleDestroySandbox is the manual, irreversible teardown. It reuses the
 // same teardown code as the expiry reaper but records the reason as
 // user_requested. Kept distinct from the automatic path in the UI.
+//
+// Idempotency: Repeated destroy calls on an already destroyed sandbox return
+// 200 OK with the tombstone rather than a 409 error. In-flight builds/deploys
+// are cancelled immediately.
 func (s *Server) handleDestroySandbox(w http.ResponseWriter, r *http.Request) {
 	sb, ok := s.requireOwnedSandbox(w, r)
 	if !ok {
 		return
 	}
-	if sb.DestroyedAt != nil {
-		writeErr(w, http.StatusConflict, "already destroyed")
+	// Idempotency: If already destroyed, return success with current tombstone
+	if sb.DestroyedAt != nil || sb.Status == db.StatusDeleted {
+		writeJSON(w, http.StatusOK, s.sandboxJSON(sb))
 		return
+	}
+	// Abort any active build or deployment in flight
+	if s.deployer != nil {
+		s.deployer.CancelDeploy(sb.ID)
 	}
 	if err := s.destroyPermentally(r.Context(), sb, db.DestroyUserRequested); err != nil {
 		s.logger.Warn("manual destroy failed", slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
@@ -141,6 +152,29 @@ func (s *Server) handleRedeploy(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	writeJSON(w, http.StatusAccepted, map[string]any{"redeploying": true})
+}
+
+func (s *Server) handleUpdateBranch(w http.ResponseWriter, r *http.Request) {
+	sb, ok := s.requireOwnedSandbox(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Branch string `json:"branch"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Branch) == "" {
+		writeErr(w, http.StatusBadRequest, "branch is required")
+		return
+	}
+	targetBranch := strings.TrimSpace(req.Branch)
+	if err := s.store.UpdateSandbox(sb.ID, map[string]any{"branch_name": targetBranch}); err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to update branch")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success": true,
+		"branch":  targetBranch,
+	})
 }
 
 // handleSandboxWarnings returns the lifetime-warning state for a sandbox so
@@ -242,6 +276,10 @@ func removeSandboxWorkDir(workRoot, subdomain string) error {
 // destroyPermentally tears a sandbox down and records its tombstone. The typo
 // in the name is intentional documentation: this is permanent and unforgettable.
 func (s *Server) destroyPermentally(ctx context.Context, sb *db.Sandbox, reason db.DestructionReason) error {
+	// Cancel any active build or deployment in flight
+	if s.deployer != nil {
+		s.deployer.CancelDeploy(sb.ID)
+	}
 	if err := s.orch.TeardownSandbox(ctx, sb); err != nil {
 		return fmt.Errorf("teardown: %w", err)
 	}
@@ -256,10 +294,6 @@ func (s *Server) destroyPermentally(ctx context.Context, sb *db.Sandbox, reason 
 				slog.String("err", err.Error()))
 			return fmt.Errorf("teardown: removing work dir: %w", err)
 		}
-	} else {
-		s.logger.Warn("manual destroy: empty subdomain, skipping work dir removal",
-			slog.String("sandbox", sb.ID))
-		return fmt.Errorf("teardown: empty subdomain")
 	}
 	now := time.Now()
 	if err := s.store.UpdateSandbox(sb.ID, map[string]any{
@@ -281,4 +315,101 @@ func (s *Server) destroyPermentally(ctx context.Context, sb *db.Sandbox, reason 
 			slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
 	}
 	return nil
+}
+
+// SandboxLogsResponse conveys state-aware logs and lifecycle descriptions.
+type SandboxLogsResponse struct {
+	Status    string   `json:"status"`
+	Available bool     `json:"available"`
+	Message   string   `json:"message"`
+	Output    string   `json:"output,omitempty"`
+	Lines     []string `json:"lines,omitempty"`
+}
+
+// handleGetSandboxLogs provides a state-aware REST endpoint for container output.
+func (s *Server) handleGetSandboxLogs(w http.ResponseWriter, r *http.Request) {
+	sb, ok := s.requireOwnedSandbox(w, r)
+	if !ok {
+		return
+	}
+
+	if sb.DestroyedAt != nil || sb.Status == db.StatusDeleted {
+		writeJSON(w, http.StatusOK, SandboxLogsResponse{
+			Status:    "DESTROYED",
+			Available: false,
+			Message:   "This sandbox has been destroyed and torn down.",
+		})
+		return
+	}
+
+	if sb.Status == db.StatusFailed {
+		writeJSON(w, http.StatusOK, SandboxLogsResponse{
+			Status:    "FAILED",
+			Available: false,
+			Message:   "Container failed during image build and is not running. Please inspect the Build Logs panel.",
+		})
+		return
+	}
+
+	if sb.Status == db.StatusBuilding || sb.Status == db.StatusQueued {
+		writeJSON(w, http.StatusOK, SandboxLogsResponse{
+			Status:    "BUILDING",
+			Available: false,
+			Message:   "Container image is currently being built. Application output will appear once the container starts.",
+		})
+		return
+	}
+
+	if sb.Status == db.StatusHibernated {
+		writeJSON(w, http.StatusOK, SandboxLogsResponse{
+			Status:    "STOPPED",
+			Available: false,
+			Message:   "Container is hibernated due to inactivity. Click Restart to wake it.",
+		})
+		return
+	}
+
+	if sb.Status == db.StatusRunning {
+		if sb.ContainerID == "" {
+			writeJSON(w, http.StatusOK, SandboxLogsResponse{
+				Status:    "STARTING",
+				Available: false,
+				Message:   "Waiting for application container to start...",
+			})
+			return
+		}
+
+		output, err := s.orch.GetRecentContainerLogs(r.Context(), sb.ContainerID, 150)
+		if err != nil {
+			writeJSON(w, http.StatusOK, SandboxLogsResponse{
+				Status:    "HEALTHCHECK_PENDING",
+				Available: false,
+				Message:   "Container is starting; waiting for application readiness...",
+			})
+			return
+		}
+
+		rawLines := strings.Split(strings.TrimSpace(output), "\n")
+		var cleanLines []string
+		for _, l := range rawLines {
+			if trimmed := strings.TrimRight(l, "\r"); trimmed != "" {
+				cleanLines = append(cleanLines, trimmed)
+			}
+		}
+
+		writeJSON(w, http.StatusOK, SandboxLogsResponse{
+			Status:    "RUNNING",
+			Available: true,
+			Message:   "Application is running.",
+			Output:    output,
+			Lines:     cleanLines,
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, SandboxLogsResponse{
+		Status:    string(sb.Status),
+		Available: false,
+		Message:   fmt.Sprintf("Sandbox is in %s state.", sb.Status),
+	})
 }

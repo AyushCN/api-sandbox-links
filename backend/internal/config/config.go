@@ -142,8 +142,8 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
-	if cfg.Builder != "nixpacks" && cfg.Builder != "railpack" {
-		return nil, fmt.Errorf("config: BUILDER must be one of [nixpacks, railpack], got %q", cfg.Builder)
+	if cfg.Builder != "nixpacks" && cfg.Builder != "railpack" && cfg.Builder != "dockerfile" {
+		return nil, fmt.Errorf("config: BUILDER must be one of [railpack, nixpacks, dockerfile], got %q", cfg.Builder)
 	}
 	if cfg.DatabaseURL == "" || cfg.RedisURL == "" {
 		return nil, fmt.Errorf("config: DATABASE_URL and REDIS_URL are required (see .env.example)")

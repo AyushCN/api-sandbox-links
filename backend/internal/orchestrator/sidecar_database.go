@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/api-sandbox-links/backend/internal/db"
 	"github.com/docker/docker/api/types/container"
+	imageTypes "github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
 )
 
@@ -44,21 +46,26 @@ func DetectDatabaseNeed(dir string) (engine string, needed bool) {
 	}
 
 	if env := readEnvExample(dir); env != "" {
+		low := strings.ToLower(env)
 		switch {
-		case strings.Contains(env, "mysql://"):
+		case strings.Contains(low, "mysql://"), strings.Contains(low, "mysql"), strings.Contains(low, "3306"):
 			return "mysql", true
-		case strings.Contains(env, "postgres://"), strings.Contains(env, "postgresql://"):
+		case strings.Contains(low, "postgres://"), strings.Contains(low, "postgresql://"), strings.Contains(low, "5432"):
 			return "postgres", true
 		}
 	}
 
-	if data := readFiles(dir, "package.json", "go.mod", "requirements.txt"); data != "" {
+	if data := readFiles(dir, "package.json", "go.mod", "requirements.txt", "Pipfile", "pyproject.toml", "docker-compose.yml", "docker-compose.yaml", "compose.yaml", "compose.yml"); data != "" {
 		low := strings.ToLower(data)
 		switch {
-		case strings.Contains(low, "mysql2"), strings.Contains(low, "github.com/go-sql-driver/mysql"):
+		case strings.Contains(low, "mysql2"), strings.Contains(low, "github.com/go-sql-driver/mysql"),
+			strings.Contains(low, "mysql-connector"), strings.Contains(low, "mysqlclient"),
+			strings.Contains(low, "pymysql"), strings.Contains(low, "aiomysql"),
+			strings.Contains(low, "image: mysql"), strings.Contains(low, "image: \"mysql\""):
 			return "mysql", true
 		case strings.Contains(low, "\"pg\""), strings.Contains(low, "psycopg"), strings.Contains(low, "gorm.io/driver/postgres"),
-			strings.Contains(low, "lib/pq"), strings.Contains(low, "jackc/pgx"):
+			strings.Contains(low, "lib/pq"), strings.Contains(low, "jackc/pgx"), strings.Contains(low, "asyncpg"),
+			strings.Contains(low, "image: postgres"), strings.Contains(low, "image: \"postgres\""):
 			return "postgres", true
 		}
 	}
@@ -81,6 +88,16 @@ func (o *Orchestrator) ProvisionDatabase(ctx context.Context, sandbox *db.Sandbo
 		return nil, "", err
 	}
 
+	// Ensure the database image is present locally before attempting container creation.
+	if _, _, err := o.docker.ImageInspectWithRaw(ctx, image); err != nil {
+		rc, pullErr := o.docker.ImagePull(ctx, image, imageTypes.PullOptions{})
+		if pullErr != nil {
+			return nil, "", fmt.Errorf("orchestrator: pulling sidecar db image %s: %w", image, pullErr)
+		}
+		_, _ = io.Copy(io.Discard, rc)
+		_ = rc.Close()
+	}
+
 	pass, err := randomSecret(16)
 	if err != nil {
 		return nil, "", fmt.Errorf("orchestrator: generating db password: %w", err)
@@ -95,22 +112,35 @@ func (o *Orchestrator) ProvisionDatabase(ctx context.Context, sandbox *db.Sandbo
 		return nil, "", fmt.Errorf("orchestrator: creating db volume: %w", err)
 	}
 
-	env := []string{}
-	mount := fmt.Sprintf("%s:/var/lib/postgresql/data", volName)
-	cc := &container.Config{Image: image, Env: env}
-	hc := sidecarHostConfig(mount, "postgres")
+	var env []string
+	var mount string
+	var hc *container.HostConfig
+
 	switch engine {
 	case "postgres":
-		// sidecarHostConfig already sets up everything
-		break
+		mount = fmt.Sprintf("%s:/var/lib/postgresql/data", volName)
+		hc = sidecarHostConfig(mount, "postgres")
+		env = []string{
+			"POSTGRES_USER=" + user,
+			"POSTGRES_PASSWORD=" + pass,
+			"POSTGRES_DB=" + dbName,
+		}
 	case "mysql":
-		mount2 := fmt.Sprintf("%s:/var/lib/mysql", volName)
-		hc2 := sidecarHostConfig(mount2, "mysql")
-		// Override the binds with the mysql-specific volume mount
-		hc2.Binds = []string{mount2}
-		hc = hc2
-		break
+		mount = fmt.Sprintf("%s:/var/lib/mysql", volName)
+		hc = sidecarHostConfig(mount, "mysql")
+		hc.Binds = []string{mount}
+		env = []string{
+			"MYSQL_USER=" + user,
+			"MYSQL_PASSWORD=" + pass,
+			"MYSQL_DATABASE=" + dbName,
+			"MYSQL_ROOT_PASSWORD=" + pass,
+		}
+	default:
+		mount = fmt.Sprintf("%s:/var/lib/postgresql/data", volName)
+		hc = sidecarHostConfig(mount, engine)
 	}
+
+	cc := &container.Config{Image: image, Env: env}
 
 	nc := &network.NetworkingConfig{EndpointsConfig: map[string]*network.EndpointSettings{
 		netName(sandbox.ID): {NetworkID: ""},

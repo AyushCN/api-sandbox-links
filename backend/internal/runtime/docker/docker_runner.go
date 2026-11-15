@@ -128,6 +128,9 @@ func (d *DockerRunner) Remove(ctx context.Context, containerID string) error {
 		return fmt.Errorf("docker_runner: client not initialized")
 	}
 	if err := d.cli.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true, RemoveVolumes: false}); err != nil {
+		if client.IsErrNotFound(err) {
+			return nil
+		}
 		return fmt.Errorf("docker_runner: remove container %s: %w", containerID, err)
 	}
 	return nil

@@ -181,7 +181,21 @@ func parseRailpackPlan(data []byte) (*BuildPlan, error) {
 
 // BuildImage compiles source code in dir into an image named `name` using `railpack build`.
 func (b *RailpackBuilder) BuildImage(ctx context.Context, dir, name string, progress io.Writer) (string, error) {
-	args := []string{"build", "--name", name, dir}
+	return b.BuildImageWithConfig(ctx, dir, name, nil, progress)
+}
+
+// BuildImageWithConfig compiles source code in dir into an image named `name` using `railpack build` and custom config.
+func (b *RailpackBuilder) BuildImageWithConfig(ctx context.Context, dir, name string, cfg *ResolvedBuildConfig, progress io.Writer) (string, error) {
+	args := []string{"build", "--name", name}
+	if cfg != nil {
+		if cfg.StartCmd != "" {
+			args = append(args, "--start-cmd", cfg.StartCmd)
+		}
+		if cfg.BuildCmd != "" {
+			args = append(args, "--build-cmd", cfg.BuildCmd)
+		}
+	}
+	args = append(args, dir)
 	cmd := exec.CommandContext(ctx, b.bin, args...)
 	cmd.Env = railpackEnv(os.Getenv("HOME"), b.buildkitHost)
 

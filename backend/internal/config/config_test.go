@@ -92,8 +92,20 @@ func TestConfigBuilderSelection(t *testing.T) {
 			expectError: false,
 		},
 		{
-			name:        "invalid builder",
+			name:        "explicit dockerfile",
 			builderEnv:  "dockerfile",
+			expected:    "dockerfile",
+			expectError: false,
+		},
+		{
+			name:        "case-insensitive dockerfile",
+			builderEnv:  "Dockerfile",
+			expected:    "dockerfile",
+			expectError: false,
+		},
+		{
+			name:        "invalid builder",
+			builderEnv:  "invalid_builder",
 			expected:    "",
 			expectError: true,
 		},

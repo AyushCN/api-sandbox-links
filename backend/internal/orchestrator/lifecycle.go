@@ -178,6 +178,7 @@ type RunOptions struct {
 	NetworkName  string            // private per-sandbox network
 	Labels       map[string]string // extra labels (traefik, provenance)
 	User         string
+	Command      []string          // optional start command override
 }
 
 // RunResult reports where the container landed so callers can store it.
@@ -253,6 +254,7 @@ func (o *Orchestrator) RunSandbox(ctx context.Context, opts RunOptions) (*RunRes
 		spec := runtime.ContainerSpec{
 			Name:            "sandbox_" + opts.SandboxID[:8] + "_" + opts.Subdomain,
 			Image:           opts.ImageTag,
+			Command:         opts.Command,
 			Env:             opts.Env,
 			Labels:          labels,
 			NetworkName:     netName(opts.SandboxID),

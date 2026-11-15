@@ -48,7 +48,9 @@ func NewBuilder(cfg *config.Config, logger *slog.Logger) (Builder, error) {
 		return NewNixpacksBuilder(cfg.NixpacksBin, logger), nil
 	case "railpack":
 		return NewRailpackBuilder(cfg.RailpackBin, cfg.BuildKitHost, logger), nil
+	case "dockerfile":
+		return NewDockerfileBuilder(cfg.DockerHost, logger), nil
 	default:
-		return nil, fmt.Errorf("orchestrator: unsupported builder engine %q (supported: nixpacks, railpack)", name)
+		return nil, fmt.Errorf("orchestrator: unsupported builder engine %q (supported: dockerfile, railpack, nixpacks)", name)
 	}
 }
