@@ -26,7 +26,7 @@ type analyzeRepoRequest struct {
 func (s *Server) handleAnalyzeRepo(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.userFrom(r)
 	if !ok {
-		writeErr(w, http.StatusUnauthorized, "not signed in", "auth_unauthorized")
+		writeErr(w, http.StatusUnauthorized, "auth_unauthorized", "not signed in")
 		return
 	}
 	if wait, ok := s.ratelim.allow(user.ID); !ok {
@@ -39,12 +39,12 @@ func (s *Server) handleAnalyzeRepo(w http.ResponseWriter, r *http.Request) {
 
 	var req analyzeRepoRequest
 	if err := decodeJSON(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "Send a JSON body with a repo_url.", "validation_missing_param")
+		writeErr(w, http.StatusBadRequest, "validation_missing_param", "Send a JSON body with a repo_url.")
 		return
 	}
 	info, err := git.ParseGitHubURL(req.RepoURL)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "That is not a GitHub repository URL. Use https://github.com/owner/repo.", "validation_invalid_repo_url")
+		writeErr(w, http.StatusBadRequest, "validation_invalid_repo_url", "That is not a GitHub repository URL. Use https://github.com/owner/repo.")
 		return
 	}
 
@@ -54,7 +54,7 @@ func (s *Server) handleAnalyzeRepo(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		status, msg := friendlyAnalyzeError(err)
 		s.logger.Warn("repo analysis failed", slog.String("repo", info.CloneURL), slog.String("err", err.Error()))
-		writeErr(w, status, msg)
+		writeErr(w, status, "analyze_failed", msg)
 		return
 	}
 	writeJSON(w, http.StatusOK, result)

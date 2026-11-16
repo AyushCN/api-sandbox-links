@@ -34,11 +34,11 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 	user, ok := s.userFrom(r)
 	if !ok {
-		writeErr(w, http.StatusUnauthorized, "not signed in")
+		writeErr(w, http.StatusUnauthorized, "auth_unauthorized", "not signed in")
 		return
 	}
 	if parent.DestroyedAt != nil {
-		writeErr(w, http.StatusConflict, "cannot fork a destroyed sandbox")
+		writeErr(w, http.StatusConflict, "sandbox_destroyed", "cannot fork a destroyed sandbox")
 		return
 	}
 
@@ -53,7 +53,7 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 	remaining := time.Until(parent.ExpiresAt)
 	childLifetime := int64(remaining / time.Second)
 	if childLifetime < MinLifetimeSeconds {
-		writeErr(w, http.StatusBadRequest,
+		writeErr(w, http.StatusBadRequest, "validation_invalid_lifetime",
 			fmt.Sprintf("lifetime_seconds must be between %d and %d", MinLifetimeSeconds, s.maxLifetime()))
 		return
 	}
@@ -63,18 +63,18 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 
 	repo, err := s.store.GetRepository(parent.RepositoryID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not load the parent repository")
+		writeErr(w, http.StatusInternalServerError, "load_repository_failed", "could not load the parent repository")
 		return
 	}
 	info, err := git.ParseGitHubURL(repo.GithubURL)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not read the parent repository URL")
+		writeErr(w, http.StatusInternalServerError, "read_repository_url_failed", "could not read the parent repository URL")
 		return
 	}
 	result, err := s.analyzer.Analyze(r.Context(), info.CloneURL, parent.BranchName)
 	if err != nil {
 		status, msg := friendlyAnalyzeError(err)
-		writeErr(w, status, msg)
+		writeErr(w, status, "analyze_failed", msg)
 		return
 	}
 	if len(result.Blockers) > 0 {
@@ -83,12 +83,12 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 	svc, err := servicesFromJSON(json.RawMessage(parent.ServicesOverride), "", result.Services)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid services selection on the parent sandbox")
+		writeErr(w, http.StatusBadRequest, "invalid_services_selection", "invalid services selection on the parent sandbox")
 		return
 	}
 	plain, err := s.plainEnv(parent.ID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not read the parent sandbox settings")
+		writeErr(w, http.StatusInternalServerError, "read_settings_failed", "could not read the parent sandbox settings")
 		return
 	}
 	mergedEnv, missing, problems := prepareEnv(plain, result, svc)
@@ -109,7 +109,7 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 
 	subdomain, err := s.uniqueSubdomain("fork-" + parent.Subdomain)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not allocate subdomain")
+		writeErr(w, http.StatusInternalServerError, "allocate_subdomain_failed", "could not allocate subdomain")
 		return
 	}
 
@@ -138,13 +138,13 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.logger.Warn("fork: creating child sandbox", slog.String("parent", parent.ID), slog.String("err", err.Error()))
-		writeErr(w, http.StatusInternalServerError, "could not create fork")
+		writeErr(w, http.StatusInternalServerError, "fork_failed", "could not create fork")
 		return
 	}
 
 	if err := s.replaceEnv(child.ID, mergedEnv); err != nil {
 		s.logger.Warn("fork: copying env vars", slog.String("sandbox", child.ID), slog.String("err", err.Error()))
-		writeErr(w, http.StatusInternalServerError, "fork was created but its settings could not be copied")
+		writeErr(w, http.StatusInternalServerError, "fork_settings_failed", "fork was created but its settings could not be copied")
 		return
 	}
 

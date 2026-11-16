@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/api-sandbox-links/backend/internal/config"
@@ -96,8 +97,11 @@ func TestAuthCallbackRejectsMissingOrMismatchedState(t *testing.T) {
 			}
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, req)
-			if rec.Code != http.StatusBadRequest {
-				t.Fatalf("status = %d, want 400", rec.Code)
+			if rec.Code != http.StatusFound {
+				t.Fatalf("status = %d, want 302", rec.Code)
+			}
+			if loc := rec.Header().Get("Location"); !strings.Contains(loc, "auth_error=invalid_state") {
+				t.Fatalf("Location = %q, want an auth_error=invalid_state redirect", loc)
 			}
 		})
 	}
@@ -111,8 +115,11 @@ func TestAuthCallbackAcceptsMatchingStateBeforeExchange(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	// No code was supplied, so it gets past the state check and fails on the
 	// code instead of exercising the network.
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400 missing code", rec.Code)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); !strings.Contains(loc, "auth_error=missing_code") {
+		t.Fatalf("Location = %q, want an auth_error=missing_code redirect", loc)
 	}
 }
 

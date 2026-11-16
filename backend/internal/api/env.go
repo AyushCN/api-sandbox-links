@@ -180,12 +180,12 @@ func (s *Server) handleUpdateEnv(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if sb.DestroyedAt != nil {
-		writeErr(w, http.StatusConflict, "This sandbox has been destroyed and cannot be edited.", "sandbox_destroyed_cannot_edit")
+		writeErr(w, http.StatusConflict, "sandbox_destroyed_cannot_edit", "This sandbox has been destroyed and cannot be edited.")
 		return
 	}
 	var req updateEnvRequest
 	if err := decodeJSON(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "Send a JSON body with env_vars.", "validation_missing_param")
+		writeErr(w, http.StatusBadRequest, "validation_missing_param", "Send a JSON body with env_vars.")
 		return
 	}
 	if req.EnvVars == nil {
@@ -193,23 +193,23 @@ func (s *Server) handleUpdateEnv(w http.ResponseWriter, r *http.Request) {
 	}
 	repo, err := s.store.GetRepository(sb.RepositoryID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not load this sandbox's repository.", "load_sandbox_repo_failed")
+		writeErr(w, http.StatusInternalServerError, "load_sandbox_repo_failed", "Could not load this sandbox's repository.")
 		return
 	}
 	info, err := git.ParseGitHubURL(repo.GithubURL)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not read this sandbox's repository URL.", "read_sandbox_repo_url_failed")
+		writeErr(w, http.StatusInternalServerError, "read_sandbox_repo_url_failed", "Could not read this sandbox's repository URL.")
 		return
 	}
 	result, err := s.analyzer.Analyze(r.Context(), info.CloneURL, sb.BranchName)
 	if err != nil {
 		status, msg := friendlyAnalyzeError(err)
-		writeErr(w, status, msg)
+		writeErr(w, status, "analyze_failed", msg)
 		return
 	}
 	svc, err := servicesFromJSON(json.RawMessage(sb.ServicesOverride), "", result.Services)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "Invalid services selection.", "validation_invalid_services")
+		writeErr(w, http.StatusBadRequest, "validation_invalid_services", "Invalid services selection.")
 		return
 	}
 	// The editor deliberately starts with blank inputs and the API never
@@ -218,7 +218,7 @@ func (s *Server) handleUpdateEnv(w http.ResponseWriter, r *http.Request) {
 	// secret the user did not retype.
 	existing, err := s.plainEnv(sb.ID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not read the existing settings.")
+		writeErr(w, http.StatusInternalServerError, "settings_read_failed", "could not read the existing settings")
 		return
 	}
 	provided := make(map[string]string, len(existing)+len(req.EnvVars))
@@ -248,7 +248,7 @@ func (s *Server) handleUpdateEnv(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.replaceEnv(sb.ID, merged); err != nil {
 		s.logger.Warn("env update failed", slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
-		writeErr(w, http.StatusInternalServerError, "Could not save these settings.", "save_settings_failed")
+		writeErr(w, http.StatusInternalServerError, "save_settings_failed", "Could not save these settings.")
 		return
 	}
 	patch := map[string]any{}

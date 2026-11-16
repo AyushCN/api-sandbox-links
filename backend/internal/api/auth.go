@@ -115,19 +115,27 @@ func (s *Server) clearOAuthState(w http.ResponseWriter) {
 	})
 }
 
+// redirectAuthError sends the browser back to the frontend with a machine code
+// the login page can surface, instead of stranding the user on a plain-text
+// error page. Codes are fixed literals, so no escaping is needed.
+func (s *Server) redirectAuthError(w http.ResponseWriter, r *http.Request, code string) {
+	http.Redirect(w, r, s.cfg.FrontendURL+"/?auth_error="+code, http.StatusFound)
+}
+
 // handleAuthCallback exchanges the code, fetches the GitHub profile, upserts
-// the user, and sets the session cookie.
+// the user, and sets the session cookie. OAuth callback failures redirect to
+// /?auth_error=<code> instead of returning plain-text errors.
 func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 	cfg := s.githubOAuthConfig()
 	if cfg == nil {
-		http.Error(w, "OAuth not configured", http.StatusNotImplemented)
+		s.redirectAuthError(w, r, "oauth_not_configured")
 		return
 	}
 	state := r.URL.Query().Get("state")
 	stateCookie, stateErr := r.Cookie(oauthStateCookieName)
 	if stateErr != nil || state == "" || subtle.ConstantTimeCompare([]byte(state), []byte(stateCookie.Value)) != 1 {
 		s.clearOAuthState(w)
-		http.Error(w, "invalid OAuth state", http.StatusBadRequest)
+		s.redirectAuthError(w, r, "invalid_state")
 		return
 	}
 	// One-shot: the state is consumed whether or not the exchange succeeds.
@@ -135,7 +143,7 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 
 	code := r.URL.Query().Get("code")
 	if code == "" {
-		http.Error(w, "missing OAuth code", http.StatusBadRequest)
+		s.redirectAuthError(w, r, "missing_code")
 		return
 	}
 
@@ -194,12 +202,14 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.userFrom(r)
 	if !ok {
-		http.Error(w, "not signed in", http.StatusUnauthorized)
+		writeErr(w, http.StatusUnauthorized, "auth_unauthorized", "not signed in")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
+		"id":         user.ID,
 		"github_id":  user.GithubID,
 		"username":   user.Username,
+		"email":      user.Email,
 		"avatar_url": user.AvatarURL,
 		"dev":        s.cfg.DevAuth,
 	})
@@ -234,6 +244,17 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 // DevAuth mode it fabricates the dev user instead of failing.
 func (s *Server) requireUser(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Bearer tokens take precedence over the session cookie so a CLI client
+		// can authenticate without one. An invalid token is a hard 401: it must
+		// not silently fall back to an unrelated session cookie.
+		if user, err := s.bearerUser(r); err != nil {
+			http.Error(w, "not signed in", http.StatusUnauthorized)
+			return
+		} else if user != nil {
+			ctx := context.WithValue(r.Context(), ctxUserKey, user)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
 		user, err := s.sessionUser(r)
 		if err != nil && !s.cfg.DevAuth {
 			http.Error(w, "not signed in", http.StatusUnauthorized)

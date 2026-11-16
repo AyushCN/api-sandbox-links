@@ -26,6 +26,11 @@ type Config struct {
 	GitHubClientSecret     string
 	GitHubOAuthCallbackURL string
 
+	// GitHubWebhookSecret is the shared secret GitHub signs push payloads
+	// with. When empty, the webhook redeploy endpoint is disabled (404/501
+	// rather than an unauthenticated redeploy trigger).
+	GitHubWebhookSecret string
+
 	// GeminiAPIKey is optional; AI features degrade gracefully when empty.
 	GeminiAPIKey string
 
@@ -130,6 +135,7 @@ func Load() (*Config, error) {
 		GitHubClientID:            os.Getenv("GITHUB_CLIENT_ID"),
 		GitHubClientSecret:        os.Getenv("GITHUB_CLIENT_SECRET"),
 		GitHubOAuthCallbackURL:    os.Getenv("GITHUB_OAUTH_CALLBACK_URL"),
+		GitHubWebhookSecret:       os.Getenv("GITHUB_WEBHOOK_SECRET"),
 		GeminiAPIKey:              os.Getenv("GEMINI_API_KEY"),
 		DockerHost:                envDefault("DOCKER_HOST", "unix:///var/run/docker.sock"),
 		SandboxWorkDir:            envDefault("SANDBOX_WORK_DIR", "/tmp/api-sandbox-links/work"),
@@ -153,9 +159,9 @@ func Load() (*Config, error) {
 		GatewayMaxBodyBytes:       envInt64Default("GATEWAY_MAX_BODY_BYTES", 32*1024*1024),
 		DevAuth:                   os.Getenv("GITHUB_CLIENT_ID") == "",
 		AppEnv:                    os.Getenv("APP_ENV"),
-		BuildMode:               os.Getenv("BUILD_MODE"),
-		ImagePruneHours:         envIntDefault("IMAGE_PRUNE_HOURS", 0),
-		DiskMinFreeGB:           envIntDefault("DISK_MIN_FREE_GB", 10),
+		BuildMode:                 os.Getenv("BUILD_MODE"),
+		ImagePruneHours:           envIntDefault("IMAGE_PRUNE_HOURS", 0),
+		DiskMinFreeGB:             envIntDefault("DISK_MIN_FREE_GB", 10),
 	}
 
 	if err := cfg.decryptKey(); err != nil {

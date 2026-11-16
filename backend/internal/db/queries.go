@@ -643,3 +643,78 @@ func (s *Store) RecoverStuckDeployments(olderThan time.Duration, reason string) 
 
 // UpsertEnvVar inserts or replaces one secret env var for a sandbox (values
 // stored encrypted; encrypt before calling).
+// ---- API tokens --------------------------------------------------------
+
+// ErrAPITokenNotFound is returned when a token row does not exist for the user
+// (or has already been revoked). Callers map it to 404, deliberately without
+// distinguishing "never existed" from "revoked".
+var ErrAPITokenNotFound = errors.New("db: api token not found")
+
+// CreateAPIToken stores a new token row. The caller hashes the plaintext
+// secret; the store never sees it.
+func (s *Store) CreateAPIToken(t *APIToken) error {
+	if err := s.db.Create(t).Error; err != nil {
+		return fmt.Errorf("db: creating api token: %w", err)
+	}
+	return nil
+}
+
+// ListAPITokens returns the user's live (not revoked) tokens, newest first.
+// Hashes are never exposed to handlers that list them.
+func (s *Store) ListAPITokens(userID string) ([]*APIToken, error) {
+	var out []*APIToken
+	if err := s.db.Where("user_id = ? AND revoked_at IS NULL", userID).
+		Order("created_at DESC").Find(&out).Error; err != nil {
+		return nil, fmt.Errorf("db: listing api tokens: %w", err)
+	}
+	return out, nil
+}
+
+// GetAPITokenByHash resolves a bearer token hash to its live row.
+func (s *Store) GetAPITokenByHash(hash string) (*APIToken, error) {
+	t := &APIToken{}
+	if err := s.db.First(t, "token_hash = ? AND revoked_at IS NULL", hash).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrAPITokenNotFound
+		}
+		return nil, fmt.Errorf("db: fetching api token: %w", err)
+	}
+	return t, nil
+}
+
+// RevokeAPIToken soft-deletes one of the user's tokens. Ownership is part of
+// the WHERE clause so one user can never revoke another's token.
+func (s *Store) RevokeAPIToken(userID, tokenID string) error {
+	res := s.db.Model(&APIToken{}).
+		Where("id = ? AND user_id = ? AND revoked_at IS NULL", tokenID, userID).
+		Update("revoked_at", time.Now().UTC())
+	if res.Error != nil {
+		return fmt.Errorf("db: revoking api token: %w", res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrAPITokenNotFound
+	}
+	return nil
+}
+
+// TouchAPITokenLastUsed records a successful bearer authentication. Best
+// effort: a failure here must not reject an otherwise valid request.
+func (s *Store) TouchAPITokenLastUsed(tokenID string) error {
+	return s.db.Model(&APIToken{}).Where("id = ?", tokenID).
+		Update("last_used_at", time.Now().UTC()).Error
+}
+
+// ListRedeployCandidates returns the live sandboxes that track the given
+// repository URL and branch. A GitHub push webhook redeploys exactly these.
+func (s *Store) ListRedeployCandidates(githubURL, branch string) ([]*Sandbox, error) {
+	var out []*Sandbox
+	err := s.db.
+		Where("repository_id IN (SELECT id FROM repositories WHERE github_url = ?)", githubURL).
+		Where("branch_name = ?", branch).
+		Where("destroyed_at IS NULL").
+		Find(&out).Error
+	if err != nil {
+		return nil, fmt.Errorf("db: listing redeploy candidates: %w", err)
+	}
+	return out, nil
+}

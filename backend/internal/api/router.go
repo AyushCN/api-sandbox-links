@@ -131,6 +131,12 @@ func (s *Server) Router() http.Handler {
 		})
 	})
 
+	// Public endpoints: config is read before sign-in (limits + feature flags),
+	// and the GitHub webhook authenticates with its HMAC signature rather than a
+	// session.
+	r.Get("/api/config", s.handleConfig)
+	r.Post("/api/webhooks/github", s.handleGithubWebhook)
+
 	// Public auth endpoints.
 	r.Get("/api/auth/github", s.handleAuthStart)
 	r.Get("/api/auth/github/callback", s.handleAuthCallback)
@@ -147,6 +153,11 @@ func (s *Server) Router() http.Handler {
 		protected.Get("/api/me", s.handleMe)
 		protected.Post("/api/repos/analyze", s.handleAnalyzeRepo)
 
+		// Personal API tokens for programmatic access.
+		protected.Get("/api/tokens", s.handleListTokens)
+		protected.Post("/api/tokens", s.handleCreateToken)
+		protected.Delete("/api/tokens/{id}", s.handleRevokeToken)
+
 		protected.Route("/api/sandboxes", func(pr chi.Router) {
 			pr.Get("/", s.handleListSandboxes)
 			pr.Post("/", s.handleCreateSandbox)
@@ -162,8 +173,12 @@ func (s *Server) Router() http.Handler {
 			pr.Post("/{id}/fork", s.handleForkSandbox)
 			pr.Get("/{id}/deployments", s.handleListDeployments)
 			pr.Post("/{id}/deploy", s.handleRedeploy)
+			pr.Post("/{id}/redeploy/approve", s.handleRedeployApprove)
+			pr.Post("/{id}/redeploy/dismiss", s.handleRedeployDismiss)
 			pr.Get("/{id}/warnings", s.handleSandboxWarnings)
 			pr.Get("/{id}/containers", s.handleContainers)
+			pr.Get("/{id}/logs", s.handleLogs)
+			pr.Post("/{id}/branch", s.handleSetBranch)
 			pr.Get("/{id}/events/ws", s.handleEventsWS)
 			pr.Get("/{id}/stats/history", s.handleStatsHistory)
 
@@ -190,13 +205,14 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// writeErr is the standard error envelope; details are never secrets.
-func writeErr(w http.ResponseWriter, status int, msg string, errorCode ...string) {
-	entry := map[string]any{"error": msg}
-	if len(errorCode) > 0 {
-		entry["error_code"] = errorCode[0]
-	}
-	writeJSON(w, status, entry)
+// writeErr is the standard error envelope; details are never secrets. The
+// human-readable message goes in "error" (what the UI shows) and the stable
+// machine code goes in "error_code" (what clients branch on).
+func writeErr(w http.ResponseWriter, status int, errorCode, message string) {
+	writeJSON(w, status, map[string]any{
+		"error":      message,
+		"error_code": errorCode,
+	})
 }
 
 // loggingMiddleware records each request's method, path, duration, and status.

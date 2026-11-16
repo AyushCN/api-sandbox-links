@@ -30,7 +30,7 @@ func (s *Server) handleListDeployments(w http.ResponseWriter, r *http.Request) {
 	}
 	rows, err := s.store.ListDeployments(sb.ID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not list deployments", "deploy_list_failed")
+		writeErr(w, http.StatusInternalServerError, "deploy_list_failed", "could not list deployments")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"deployments": rows})
@@ -45,16 +45,16 @@ func (s *Server) handleExtendLifetime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if sb.DestroyedAt != nil {
-		writeErr(w, http.StatusConflict, "this sandbox is already destroyed and cannot be extended", "sandbox_destroyed")
+		writeErr(w, http.StatusConflict, "sandbox_destroyed", "this sandbox is already destroyed and cannot be extended")
 		return
 	}
 	var req extendLifetimeRequest
 	if err := decodeJSON(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "additional_seconds is required", "validation_missing_param")
+		writeErr(w, http.StatusBadRequest, "validation_missing_param", "additional_seconds is required")
 		return
 	}
 	if req.AdditionalSeconds <= 0 {
-		writeErr(w, http.StatusBadRequest, "additional_seconds must be positive", "validation_positive")
+		writeErr(w, http.StatusBadRequest, "validation_positive", "additional_seconds must be positive")
 		return
 	}
 
@@ -83,7 +83,7 @@ func (s *Server) handleExtendLifetime(w http.ResponseWriter, r *http.Request) {
 		"expires_at":       newExpiry,
 		"lifetime_seconds": int64(newExpiry.Sub(sb.CreatedAt).Seconds()),
 	}); err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not extend lifetime", "lifetime_extend_failed")
+		writeErr(w, http.StatusInternalServerError, "lifetime_extend_failed", "could not extend lifetime")
 		return
 	}
 	sb.ExpiresAt = newExpiry
@@ -107,12 +107,12 @@ func (s *Server) handleDestroySandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if sb.DestroyedAt != nil {
-		writeErr(w, http.StatusConflict, "already destroyed", "sandbox_destroyed")
+		writeErr(w, http.StatusConflict, "sandbox_destroyed", "already destroyed")
 		return
 	}
 	if err := s.destroyPermentally(r.Context(), sb, db.DestroyUserRequested); err != nil {
 		s.logger.Warn("manual destroy failed", slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
-		writeErr(w, http.StatusInternalServerError, "could not destroy sandbox", "destroy_failed")
+		writeErr(w, http.StatusInternalServerError, "destroy_failed", "could not destroy sandbox")
 		return
 	}
 	// destroyPermentally updates the row, not the in-memory struct. Re-read it
@@ -121,7 +121,7 @@ func (s *Server) handleDestroySandbox(w http.ResponseWriter, r *http.Request) {
 	destroyed, err := s.store.GetSandbox(sb.ID)
 	if err != nil {
 		s.logger.Warn("manual destroy reload failed", slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
-		writeErr(w, http.StatusInternalServerError, "sandbox destroyed but could not be reloaded", "reload_failed")
+		writeErr(w, http.StatusInternalServerError, "reload_failed", "sandbox destroyed but could not be reloaded")
 		return
 	}
 	writeJSON(w, http.StatusOK, s.sandboxJSON(destroyed))
@@ -144,17 +144,17 @@ func (s *Server) handleRecreateSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 	user, ok := s.userFrom(r)
 	if !ok {
-		writeErr(w, http.StatusUnauthorized, "not signed in", "auth_unauthorized")
+		writeErr(w, http.StatusUnauthorized, "auth_unauthorized", "not signed in")
 		return
 	}
 	if parent.DestroyedAt == nil {
-		writeErr(w, http.StatusConflict, "only destroyed sandboxes can be recreated", "only_destroyed_recreate")
+		writeErr(w, http.StatusConflict, "only_destroyed_recreate", "only destroyed sandboxes can be recreated")
 		return
 	}
 
 	var req recreateSandboxRequest
 	if err := decodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
-		writeErr(w, http.StatusBadRequest, "invalid request body", "validation_invalid_body")
+		writeErr(w, http.StatusBadRequest, "validation_invalid_body", "invalid request body")
 		return
 	}
 	lifetime := req.LifetimeSeconds
@@ -169,7 +169,7 @@ func (s *Server) handleRecreateSandbox(w http.ResponseWriter, r *http.Request) {
 			lifetime = s.maxLifetime()
 		}
 	} else if lifetime < MinLifetimeSeconds || lifetime > s.maxLifetime() {
-		writeErr(w, http.StatusBadRequest,
+		writeErr(w, http.StatusBadRequest, "validation_invalid_lifetime",
 			fmt.Sprintf("lifetime_seconds must be between %d and %d", MinLifetimeSeconds, s.maxLifetime()))
 		return
 	}
@@ -178,21 +178,21 @@ func (s *Server) handleRecreateSandbox(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.logger.Warn("recreate: loading repository",
 			slog.String("sandbox", parent.ID), slog.String("err", err.Error()))
-		writeErr(w, http.StatusInternalServerError, "could not load repository", "load_repository_failed")
+		writeErr(w, http.StatusInternalServerError, "load_repository_failed", "could not load repository")
 		return
 	}
 
 	name := parent.Subdomain
 	info, err := git.ParseGitHubURL(repo.GithubURL)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not read the repository URL", "read_repository_url_failed")
+		writeErr(w, http.StatusInternalServerError, "read_repository_url_failed", "could not read the repository URL")
 		return
 	}
 	name = info.Name
 	result, err := s.analyzer.Analyze(r.Context(), info.CloneURL, parent.BranchName)
 	if err != nil {
 		status, msg := friendlyAnalyzeError(err)
-		writeErr(w, status, msg)
+		writeErr(w, status, "analyze_failed", msg)
 		return
 	}
 	if len(result.Blockers) > 0 {
@@ -201,12 +201,12 @@ func (s *Server) handleRecreateSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 	svc, err := servicesFromJSON(json.RawMessage(parent.ServicesOverride), "", result.Services)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid services selection on the parent sandbox", "invalid_services_selection")
+		writeErr(w, http.StatusBadRequest, "invalid_services_selection", "invalid services selection on the parent sandbox")
 		return
 	}
 	plainEnv, err := s.plainEnv(parent.ID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not read the previous sandbox settings", "read_settings_failed")
+		writeErr(w, http.StatusInternalServerError, "read_settings_failed", "could not read the previous sandbox settings")
 		return
 	}
 	mergedEnv, missing, problems := prepareEnv(plainEnv, result, svc)
@@ -226,7 +226,7 @@ func (s *Server) handleRecreateSandbox(w http.ResponseWriter, r *http.Request) {
 
 	subdomain, err := s.uniqueSubdomain(name)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not allocate subdomain", "allocate_subdomain_failed")
+		writeErr(w, http.StatusInternalServerError, "allocate_subdomain_failed", "could not allocate subdomain")
 		return
 	}
 
@@ -257,7 +257,7 @@ func (s *Server) handleRecreateSandbox(w http.ResponseWriter, r *http.Request) {
 		default:
 			s.logger.Warn("recreate: creating sandbox",
 				slog.String("parent", parent.ID), slog.String("err", err.Error()))
-			writeErr(w, http.StatusInternalServerError, "could not recreate sandbox", "recreate_failed")
+			writeErr(w, http.StatusInternalServerError, "recreate_failed", "could not recreate sandbox")
 		}
 		return
 	}
@@ -265,7 +265,7 @@ func (s *Server) handleRecreateSandbox(w http.ResponseWriter, r *http.Request) {
 	if err := s.replaceEnv(child.ID, mergedEnv); err != nil {
 		s.logger.Warn("recreate: copying env vars",
 			slog.String("sandbox", child.ID), slog.String("err", err.Error()))
-		writeErr(w, http.StatusInternalServerError, "sandbox was recreated but its settings could not be copied", "recreate_settings_failed")
+		writeErr(w, http.StatusInternalServerError, "recreate_settings_failed", "sandbox was recreated but its settings could not be copied")
 		return
 	}
 
@@ -294,23 +294,23 @@ func (s *Server) handleRedeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if sb.DestroyedAt != nil {
-		writeErr(w, http.StatusConflict, "destroyed sandboxes cannot be redeployed; recreate instead", "destroyed_cannot_redeploy")
+		writeErr(w, http.StatusConflict, "destroyed_cannot_redeploy", "destroyed sandboxes cannot be redeployed; recreate instead")
 		return
 	}
 	repo, err := s.store.GetRepository(sb.RepositoryID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not load the repository", "load_repository_failed_2")
+		writeErr(w, http.StatusInternalServerError, "load_repository_failed_2", "could not load the repository")
 		return
 	}
 	info, err := git.ParseGitHubURL(repo.GithubURL)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not read the repository URL", "read_repository_url_failed")
+		writeErr(w, http.StatusInternalServerError, "read_repository_url_failed", "could not read the repository URL")
 		return
 	}
 	result, err := s.analyzer.Analyze(r.Context(), info.CloneURL, sb.BranchName)
 	if err != nil {
 		status, msg := friendlyAnalyzeError(err)
-		writeErr(w, status, msg)
+		writeErr(w, status, "analyze_failed", msg)
 		return
 	}
 	if len(result.Blockers) > 0 {
@@ -319,12 +319,12 @@ func (s *Server) handleRedeploy(w http.ResponseWriter, r *http.Request) {
 	}
 	svc, err := servicesFromJSON(json.RawMessage(sb.ServicesOverride), "", result.Services)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid services selection", "validation_invalid_services")
+		writeErr(w, http.StatusBadRequest, "validation_invalid_services", "invalid services selection")
 		return
 	}
 	plainEnv, err := s.plainEnv(sb.ID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not read the sandbox settings", "read_sandbox_settings_failed")
+		writeErr(w, http.StatusInternalServerError, "read_sandbox_settings_failed", "could not read the sandbox settings")
 		return
 	}
 	_, missing, problems := prepareEnv(plainEnv, result, svc)
@@ -351,6 +351,34 @@ func (s *Server) handleRedeploy(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]any{"redeploying": true})
 }
 
+// handleRedeployApprove approves a pending redeploy for a sandbox.
+func (s *Server) handleRedeployApprove(w http.ResponseWriter, r *http.Request) {
+	sb, ok := s.requireOwnedSandbox(w, r)
+	if !ok {
+		return
+	}
+	// Mark the redeploy as approved and trigger immediate redeploy
+	opts := orchestrator.DeployOptions{Trigger: db.TriggerSaveRedeploy}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), orchestrator.DeployTimeout)
+		defer cancel()
+		if err := s.deployer.DeploySandbox(ctx, sb, opts); err != nil {
+			s.logger.Warn("approved redeploy failed", slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
+		}
+	}()
+	writeJSON(w, http.StatusOK, map[string]any{"approved": true, "sandbox_id": sb.ID})
+}
+
+// handleRedeployDismiss dismisses a pending redeploy for a sandbox.
+func (s *Server) handleRedeployDismiss(w http.ResponseWriter, r *http.Request) {
+	sb, ok := s.requireOwnedSandbox(w, r)
+	if !ok {
+		return
+	}
+	// Mark the redeploy as dismissed (no action taken)
+	writeJSON(w, http.StatusOK, map[string]any{"dismissed": true, "sandbox_id": sb.ID})
+}
+
 // handleSandboxWarnings returns the lifetime-warning state for a sandbox so
 // the frontend can render banners on list and detail views (section 2a req 3).
 func (s *Server) handleSandboxWarnings(w http.ResponseWriter, r *http.Request) {
@@ -360,7 +388,7 @@ func (s *Server) handleSandboxWarnings(w http.ResponseWriter, r *http.Request) {
 	}
 	thresholds, err := s.store.ListWarningThresholds(sb.ID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not read warnings", "read_warnings_failed")
+		writeErr(w, http.StatusInternalServerError, "read_warnings_failed", "could not read warnings")
 		return
 	}
 	remaining := time.Until(sb.ExpiresAt)
@@ -420,7 +448,7 @@ func (s *Server) handleStatsHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	span, ok := statsRanges[name]
 	if !ok {
-		writeErr(w, http.StatusBadRequest, "range must be one of 1h, 6h, 24h, 7d", "validation_invalid_range")
+		writeErr(w, http.StatusBadRequest, "validation_invalid_range", "range must be one of 1h, 6h, 24h, 7d")
 		return
 	}
 
@@ -428,7 +456,7 @@ func (s *Server) handleStatsHistory(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.store.QueryResourceSnapshots(sb.ID, now.Add(-span.window), now, span.limit)
 	if err != nil {
 		s.logger.Warn("stats history query failed", slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
-		writeErr(w, http.StatusInternalServerError, "could not query resource history", "query_history_failed")
+		writeErr(w, http.StatusInternalServerError, "query_history_failed", "could not query resource history")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -443,26 +471,26 @@ func (s *Server) handleStatsHistory(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleQuota(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.userFrom(r)
 	if !ok {
-		writeErr(w, http.StatusUnauthorized, "not signed in", "auth_unauthorized")
+		writeErr(w, http.StatusUnauthorized, "auth_unauthorized", "not signed in")
 		return
 	}
 	active, err := s.store.CountActiveSandboxes(user.ID)
 	if err != nil {
 		s.logger.Warn("quota: counting user sandboxes failed", slog.String("err", err.Error()))
-		writeErr(w, http.StatusInternalServerError, "could not count sandboxes")
+		writeErr(w, http.StatusInternalServerError, "quota_count_failed", "could not count sandboxes")
 		return
 	}
 	globalRunning, err := s.store.CountGlobalRunningSandboxes()
 	if err != nil {
 		s.logger.Warn("quota: counting global sandboxes failed", slog.String("err", err.Error()))
-		writeErr(w, http.StatusInternalServerError, "could not count global sandboxes")
+		writeErr(w, http.StatusInternalServerError, "quota_global_count_failed", "could not count global sandboxes")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"active":     active,
-		"limit":      s.maxActiveSandboxes(),
+		"active":         active,
+		"limit":          s.maxActiveSandboxes(),
 		"global_running": globalRunning,
-		"global_cap":   s.maxRunningSandboxes(),
+		"global_cap":     s.maxRunningSandboxes(),
 	})
 }
 
@@ -533,23 +561,23 @@ func (s *Server) handleRetry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if sb.DestroyedAt != nil {
-		writeErr(w, http.StatusConflict, "destroyed sandboxes cannot be redeployed; recreate instead", "destroyed_cannot_redeploy")
+		writeErr(w, http.StatusConflict, "destroyed_cannot_redeploy", "destroyed sandboxes cannot be redeployed; recreate instead")
 		return
 	}
 	repo, err := s.store.GetRepository(sb.RepositoryID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not load the repository", "load_repository_failed_2")
+		writeErr(w, http.StatusInternalServerError, "load_repository_failed_2", "could not load the repository")
 		return
 	}
 	info, err := git.ParseGitHubURL(repo.GithubURL)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not read the repository URL", "read_repository_url_failed")
+		writeErr(w, http.StatusInternalServerError, "read_repository_url_failed", "could not read the repository URL")
 		return
 	}
 	result, err := s.analyzer.Analyze(r.Context(), info.CloneURL, sb.BranchName)
 	if err != nil {
 		status, msg := friendlyAnalyzeError(err)
-		writeErr(w, status, msg)
+		writeErr(w, status, "analyze_failed", msg)
 		return
 	}
 	if len(result.Blockers) > 0 {
@@ -558,12 +586,12 @@ func (s *Server) handleRetry(w http.ResponseWriter, r *http.Request) {
 	}
 	svc, err := servicesFromJSON(json.RawMessage(sb.ServicesOverride), "", result.Services)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid services selection", "validation_invalid_services")
+		writeErr(w, http.StatusBadRequest, "validation_invalid_services", "invalid services selection")
 		return
 	}
 	plainEnv, err := s.plainEnv(sb.ID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not read the sandbox settings", "read_sandbox_settings_failed")
+		writeErr(w, http.StatusInternalServerError, "read_sandbox_settings_failed", "could not read the sandbox settings")
 		return
 	}
 	_, missing, problems := prepareEnv(plainEnv, result, svc)
@@ -591,9 +619,10 @@ func (s *Server) handleRetry(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleEventsWS streams status events for GET /api/events/ws.
-// It pushes {type:"sandbox",id,status,url?,error?,expires_at} whenever a
+// It pushes {type:"sandbox",id,status,stage,stage_message} whenever a
 // sandbox changes state, plus {type:"warning"} for lifetime thresholds.
 // Includes a heartbeat.
+// Every frame includes: type, status, stage, stage_message
 func (s *Server) handleEventsWS(w http.ResponseWriter, r *http.Request) {
 	ws, sb := s.upgrade(w, r)
 	if ws == nil {
@@ -606,20 +635,14 @@ func (s *Server) handleEventsWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Send initial state.
+	// Send initial state with stage.
+	stage, stageMessage := s.computeStage(sb)
 	ws.send(wsEvent{
-		Type: "sandbox",
-		Stream: sb.ID,
-		Line: string(sb.Status),
-		Reason: func() string {
-			switch {
-			case sb.DestroyedAt != nil:
-				return "destroyed"
-			case sb.Status != db.StatusRunning:
-				return string(sb.Status)
-			}
-			return ""
-		}(),
+		Type:     "sandbox",
+		Stream:   sb.ID,
+		Line:     string(sb.Status),
+		Stage:    &stage,
+		StageMsg: &stageMessage,
 	})
 
 	// Send warning if lifetime is approaching threshold.
@@ -634,14 +657,20 @@ func (s *Server) handleEventsWS(w http.ResponseWriter, r *http.Request) {
 
 	// Track last sent state to avoid flooding.
 	lastStatus := sb.Status
+	lastStage := stage
 
 	for {
 		select {
 		case <-ws.ctx.Done():
 			return
 		case <-heartbeat.C:
-			// Send a heartbeat frame.
-			ws.send(wsEvent{Type: "heartbeat"})
+			// Send a heartbeat frame with current stage.
+			stage, stageMessage = s.computeStage(sb)
+			ws.send(wsEvent{
+				Type:     "heartbeat",
+				Stage:    &stage,
+				StageMsg: &stageMessage,
+			})
 		default:
 			// Re-read the sandbox state.
 			sb, err := s.store.GetSandbox(sb.ID)
@@ -650,24 +679,18 @@ func (s *Server) handleEventsWS(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			// Send state change if it changed.
-			if sb.Status != lastStatus {
+			// Send state change if status or stage changed.
+			stage, stageMessage = s.computeStage(sb)
+			if sb.Status != lastStatus || stage != lastStage {
 				lastStatus = sb.Status
-				reason := ""
-				switch {
-				case sb.DestroyedAt != nil:
-					reason = "destroyed"
-				case sb.Status != db.StatusRunning:
-					reason = string(sb.Status)
-				}
-				if reason != "" {
-					ws.send(wsEvent{
-						Type: "sandbox",
-						Stream: sb.ID,
-						Line: string(sb.Status),
-						Reason: reason,
-					})
-				}
+				lastStage = stage
+				ws.send(wsEvent{
+					Type:     "sandbox",
+					Stream:   sb.ID,
+					Line:     string(sb.Status),
+					Stage:    &stage,
+					StageMsg: &stageMessage,
+				})
 			}
 
 			// Check lifetime warning thresholds.
@@ -741,17 +764,17 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if sb.DestroyedAt != nil {
-		writeErr(w, http.StatusConflict, "cannot stop a destroyed sandbox", "cannot_stop_destroyed")
+		writeErr(w, http.StatusConflict, "cannot_stop_destroyed", "cannot stop a destroyed sandbox")
 		return
 	}
 	if sb.Status != db.StatusRunning {
-		writeErr(w, http.StatusBadRequest, "only running sandboxes can be stopped", "only_running_stop")
+		writeErr(w, http.StatusBadRequest, "only_running_stop", "only running sandboxes can be stopped")
 		return
 	}
 	sb.Status = db.StatusHibernated
 	if err := s.store.UpdateSandbox(sb.ID, map[string]any{"status": string(db.StatusHibernated)}); err != nil {
 		s.logger.Warn("sandbox: update status failed", slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
-		writeErr(w, http.StatusInternalServerError, "could not update sandbox status")
+		writeErr(w, http.StatusInternalServerError, "status_update_failed", "could not update sandbox status")
 		return
 	}
 	writeJSON(w, http.StatusOK, s.sandboxJSON(sb))
@@ -764,17 +787,17 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if sb.DestroyedAt != nil {
-		writeErr(w, http.StatusConflict, "cannot start a destroyed sandbox", "cannot_start_destroyed")
+		writeErr(w, http.StatusConflict, "cannot_start_destroyed", "cannot start a destroyed sandbox")
 		return
 	}
 	if sb.Status != db.StatusHibernated {
-		writeErr(w, http.StatusBadRequest, "only hibernated sandboxes can be started", "only_hibernated_start")
+		writeErr(w, http.StatusBadRequest, "only_hibernated_start", "only hibernated sandboxes can be started")
 		return
 	}
 	sb.Status = db.StatusRunning
 	if err := s.store.UpdateSandbox(sb.ID, map[string]any{"status": string(db.StatusRunning)}); err != nil {
 		s.logger.Warn("sandbox: update status failed", slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
-		writeErr(w, http.StatusInternalServerError, "could not update sandbox status")
+		writeErr(w, http.StatusInternalServerError, "status_update_failed", "could not update sandbox status")
 		return
 	}
 	writeJSON(w, http.StatusOK, s.sandboxJSON(sb))
@@ -792,18 +815,19 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "idle_timeout_seconds is required", "validation_missing_param")
+		writeErr(w, http.StatusBadRequest, "validation_missing_param", "idle_timeout_seconds is required")
 		return
 	}
-	if req.IdleTimeoutSeconds < 600 || req.IdleTimeoutSeconds > 86400 {
-		writeErr(w, http.StatusBadRequest,
-			fmt.Sprintf("idle_timeout_seconds must be between 600 and 86400, got %d", req.IdleTimeoutSeconds))
+	if req.IdleTimeoutSeconds < MinIdleTimeoutSeconds || req.IdleTimeoutSeconds > MaxIdleTimeoutSeconds {
+		writeErr(w, http.StatusBadRequest, "validation_invalid_idle_timeout",
+			fmt.Sprintf("idle_timeout_seconds must be between %d and %d, got %d",
+				MinIdleTimeoutSeconds, MaxIdleTimeoutSeconds, req.IdleTimeoutSeconds))
 		return
 	}
 	sb.IdleTimeoutSeconds = req.IdleTimeoutSeconds
 	if err := s.store.UpdateSandbox(sb.ID, map[string]any{"idle_timeout_seconds": sb.IdleTimeoutSeconds}); err != nil {
 		s.logger.Warn("sandbox: update settings failed", slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
-		writeErr(w, http.StatusInternalServerError, "could not update sandbox settings")
+		writeErr(w, http.StatusInternalServerError, "settings_update_failed", "could not update sandbox settings")
 		return
 	}
 	writeJSON(w, http.StatusOK, s.sandboxJSON(sb))

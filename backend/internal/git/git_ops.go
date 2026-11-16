@@ -175,3 +175,37 @@ func Push(ctx context.Context, dir, remoteBranch, token string, force bool) erro
 	}
 	return nil
 }
+
+// SyncToRemote brings an existing working copy up to date with origin/<branch>.
+// A push webhook uses it before redeploying: DeploySandbox only clones when the
+// working copy is missing, so without a fetch the redeploy would rebuild the
+// commit that was already there. Public repositories need no auth, which
+// matches the only repositories sandboxes accept.
+func SyncToRemote(ctx context.Context, dir, branch string) error {
+	repo, err := git.PlainOpenWithOptions(dir, &git.PlainOpenOptions{DetectDotGit: true})
+	if err != nil {
+		return fmt.Errorf("git: opening repo at %s: %w", dir, err)
+	}
+	refspec := config.RefSpec(fmt.Sprintf("+refs/heads/%s:refs/remotes/origin/%s", branch, branch))
+	err = repo.FetchContext(ctx, &git.FetchOptions{
+		RemoteName: "origin",
+		RefSpecs:   []config.RefSpec{refspec},
+		Depth:      1,
+		Force:      true,
+	})
+	if err != nil && err != git.NoErrAlreadyUpToDate {
+		return fmt.Errorf("git: fetching %s: %w", branch, err)
+	}
+	remote, err := repo.Reference(plumbing.NewRemoteReferenceName("origin", branch), true)
+	if err != nil {
+		return fmt.Errorf("git: reading origin/%s: %w", branch, err)
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		return fmt.Errorf("git: opening worktree: %w", err)
+	}
+	if err := wt.Reset(&git.ResetOptions{Commit: remote.Hash(), Mode: git.HardReset}); err != nil {
+		return fmt.Errorf("git: resetting to origin/%s: %w", branch, err)
+	}
+	return nil
+}

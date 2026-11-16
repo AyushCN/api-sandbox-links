@@ -41,6 +41,12 @@ const (
 	// lifetime clock starts at first activation, so anything shorter would be
 	// spent largely on the build itself. One hour is the floor.
 	MinLifetimeSeconds = 60 * 60
+
+	// Idle-timeout bounds (seconds) shared with the frontend's settings form.
+	// Ten minutes is the shortest hibernate delay that still avoids flapping;
+	// one day is the longest an idle sandbox is worth keeping warm.
+	MinIdleTimeoutSeconds = 600
+	MaxIdleTimeoutSeconds = 86400
 )
 
 // createSandboxRequest is the body of POST /api/sandboxes.
@@ -62,13 +68,13 @@ type createSandboxRequest struct {
 func (s *Server) handleListSandboxes(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.userFrom(r)
 	if !ok {
-		writeErr(w, http.StatusUnauthorized, "not signed in", "auth_unauthorized")
+		writeErr(w, http.StatusUnauthorized, "auth_unauthorized", "not signed in")
 		return
 	}
 	rows, err := s.store.ListSandboxes(user.ID)
 	if err != nil {
 		s.logger.Warn("list sandboxes failed", slog.String("err", err.Error()))
-		writeErr(w, http.StatusInternalServerError, "could not list sandboxes", "list_sandboxes_failed")
+		writeErr(w, http.StatusInternalServerError, "list_sandboxes_failed", "could not list sandboxes")
 		return
 	}
 	out := make([]map[string]any, 0, len(rows))
@@ -84,21 +90,21 @@ func (s *Server) handleListSandboxes(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.userFrom(r)
 	if !ok {
-		writeErr(w, http.StatusUnauthorized, "not signed in", "auth_unauthorized")
+		writeErr(w, http.StatusUnauthorized, "auth_unauthorized", "not signed in")
 		return
 	}
 	var req createSandboxRequest
 	if err := decodeJSON(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeErr(w, http.StatusBadRequest, "validation_invalid_body", err.Error())
 		return
 	}
 	if req.RepoURL == "" {
-		writeErr(w, http.StatusBadRequest, "repo_url is required", "validation_missing_param")
+		writeErr(w, http.StatusBadRequest, "validation_missing_param", "repo_url is required")
 		return
 	}
 	info, err := git.ParseGitHubURL(req.RepoURL)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeErr(w, http.StatusBadRequest, "validation_invalid_repo_url", err.Error())
 		return
 	}
 
@@ -109,7 +115,7 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		lifetime = 24 * 3600 // schema default
 	}
 	if lifetime < MinLifetimeSeconds || lifetime > s.maxLifetime() {
-		writeErr(w, http.StatusBadRequest,
+		writeErr(w, http.StatusBadRequest, "validation_invalid_lifetime",
 			fmt.Sprintf("lifetime_seconds must be between %d and %d", MinLifetimeSeconds, s.maxLifetime()))
 		return
 	}
@@ -140,7 +146,7 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		status, msg := friendlyAnalyzeError(err)
 		s.logger.Warn("create preflight failed", slog.String("repo", info.CloneURL), slog.String("err", err.Error()))
-		writeErr(w, status, msg)
+		writeErr(w, status, "analyze_failed", msg)
 		return
 	}
 	if len(result.Blockers) > 0 {
@@ -166,13 +172,13 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	repo, err := s.store.FindOrCreateRepository(user.ID, info.CloneURL, info.DefaultBranch)
 	if err != nil {
 		s.logger.Warn("repository lookup failed", slog.String("err", err.Error()))
-		writeErr(w, http.StatusInternalServerError, "could not store repository", "store_repository_failed")
+		writeErr(w, http.StatusInternalServerError, "store_repository_failed", "could not store repository")
 		return
 	}
 
 	subdomain, err := s.uniqueSubdomain(info.Name)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not allocate subdomain", "allocate_subdomain_failed")
+		writeErr(w, http.StatusInternalServerError, "allocate_subdomain_failed", "could not allocate subdomain")
 		return
 	}
 
@@ -200,7 +206,7 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.logger.Warn("sandbox create failed", slog.String("err", err.Error()))
-		writeErr(w, http.StatusInternalServerError, "could not create sandbox", "create_sandbox_failed")
+		writeErr(w, http.StatusInternalServerError, "create_sandbox_failed", "could not create sandbox")
 		return
 	}
 
@@ -208,7 +214,7 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	// every required setting is present.
 	if err := s.replaceEnv(sandbox.ID, mergedEnv); err != nil {
 		s.logger.Warn("create: storing env vars", slog.String("sandbox", sandbox.ID), slog.String("err", err.Error()))
-		writeErr(w, http.StatusInternalServerError, "Sandbox was created but its settings could not be saved. Destroy it and try again.", "create_sandbox_settings_failed")
+		writeErr(w, http.StatusInternalServerError, "create_sandbox_settings_failed", "Sandbox was created but its settings could not be saved. Destroy it and try again.")
 		return
 	}
 
@@ -230,17 +236,42 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, s.sandboxJSON(sandbox))
 }
 
+// setBranchRequest is the body of POST /api/sandboxes/{id}/branch. The
+// frontend does the actual git checkout in the working copy; this only records
+// the new branch so subsequent redeploys and clones use it.
+type setBranchRequest struct {
+	Branch string `json:"branch"`
+}
+
+// handleSetBranch records the branch a sandbox tracks. It backs the frontend's
+// "create branch" and "checkout branch" actions.
+func (s *Server) handleSetBranch(w http.ResponseWriter, r *http.Request) {
+	sb, ok := s.requireOwnedSandbox(w, r)
+	if !ok {
+		return
+	}
+	var req setBranchRequest
+	if err := decodeJSON(r, &req); err != nil || strings.TrimSpace(req.Branch) == "" {
+		writeErr(w, http.StatusBadRequest, "validation_missing_param", "branch is required")
+		return
+	}
+	branch := strings.TrimSpace(req.Branch)
+	if err := s.store.UpdateSandbox(sb.ID, map[string]any{"branch_name": branch}); err != nil {
+		s.logger.Warn("sandbox: update branch failed", slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
+		writeErr(w, http.StatusInternalServerError, "branch_update_failed", "could not update the branch")
+		return
+	}
+	sb.BranchName = branch
+	writeJSON(w, http.StatusOK, s.sandboxJSON(sb))
+}
+
 // handleGetSandbox returns one sandbox's current state.
 func (s *Server) handleGetSandbox(w http.ResponseWriter, r *http.Request) {
 	sb, ok := s.requireOwnedSandbox(w, r)
 	if !ok {
 		return
 	}
-	out := s.sandboxJSON(sb)
-	if repo, err := s.store.GetRepository(sb.RepositoryID); err == nil {
-		out["repo_url"] = repo.GithubURL
-	}
-	writeJSON(w, http.StatusOK, out)
+	writeJSON(w, http.StatusOK, s.sandboxJSON(sb))
 }
 
 // --- helpers -------------------------------------------------------------
@@ -283,12 +314,12 @@ func (s *Server) authorizeSandboxAccess(r *http.Request) (*db.Sandbox, error) {
 // authorizeSandboxAccess: it writes the error response and reports ok=false.
 func (s *Server) requireOwnedSandbox(w http.ResponseWriter, r *http.Request) (*db.Sandbox, bool) {
 	if _, ok := s.userFrom(r); !ok {
-		writeErr(w, http.StatusUnauthorized, "not signed in", "auth_unauthorized")
+		writeErr(w, http.StatusUnauthorized, "auth_unauthorized", "not signed in")
 		return nil, false
 	}
 	sb, err := s.authorizeSandboxAccess(r)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "sandbox not found", "sandbox_not_found")
+		writeErr(w, http.StatusNotFound, "sandbox_not_found", "sandbox not found")
 		return nil, false
 	}
 	return sb, true
@@ -296,11 +327,29 @@ func (s *Server) requireOwnedSandbox(w http.ResponseWriter, r *http.Request) (*d
 
 // sandboxJSON renders a sandbox row plus computed fields the UI needs.
 func (s *Server) sandboxJSON(sb *db.Sandbox) map[string]any {
+	stage, stageMessage := s.computeStage(sb)
+
+	// Resolve the repository once: repo_url is what the UI links to, and
+	// repo_name is the bare name shown when the URL is not available.
+	repoURL, repoName := "", ""
+	if repo, err := s.store.GetRepository(sb.RepositoryID); err == nil {
+		repoURL = repo.GithubURL
+		if info, err := git.ParseGitHubURL(repoURL); err == nil {
+			repoName = info.Name
+		}
+	}
+
+	services := map[string]any{"postgres": false, "mysql": false, "redis": false, "reasons": []string{}}
+	if svc, err := servicesFromJSON(json.RawMessage(sb.ServicesOverride), "", analyze.Services{}); err == nil {
+		services = servicesJSON(svc)
+	}
+
 	return map[string]any{
 		"id":                   sb.ID,
 		"subdomain":            sb.Subdomain,
 		"url":                  "http://" + sb.Subdomain + "." + s.cfg.SandboxBaseDomain,
-		"status":               sb.Status,
+		"repo_url":             repoURL,
+		"repo_name":            repoName,
 		"branch":               sb.BranchName,
 		"parent_sandbox_id":    sb.ParentSandboxID,
 		"container_id":         sb.ContainerID,
@@ -308,19 +357,53 @@ func (s *Server) sandboxJSON(sb *db.Sandbox) map[string]any {
 		"idle_timeout_seconds": sb.IdleTimeoutSeconds,
 		"last_request_at":      sb.LastRequestAt,
 		"lifetime_seconds":     sb.LifetimeSeconds,
+		"remaining_seconds":    int64(time.Until(sb.ExpiresAt) / time.Second),
 		"expires_at":           sb.ExpiresAt,
-		// Null until the sandbox first goes live; the client uses it to show that
-		// the lifetime clock has not started yet.
-		"activated_at":       sb.ActivatedAt,
-		"destroyed_at":       sb.DestroyedAt,
-		"destruction_reason": sb.DestructionReason,
-		"detected_language":  sb.DetectedLanguage,
-		"start_command":      sb.StartCommand,
-		"services":           json.RawMessage(sb.ServicesOverride),
-		"env_vars":           s.envKeysJSON(sb.ID),
-		"build_config":       sb.BuildConfig,
-		"created_at":         sb.CreatedAt,
-		"updated_at":         sb.UpdatedAt,
+		"activated_at":         sb.ActivatedAt,
+		"destroyed_at":         sb.DestroyedAt,
+		"destruction_reason":   sb.DestructionReason,
+		"detected_language":    sb.DetectedLanguage,
+		"framework":            sb.DetectedLanguage,
+		"start_command":        sb.StartCommand,
+		"services":             services,
+		"env_vars":             s.envKeysJSON(sb.ID),
+		"build_config":         sb.BuildConfig,
+		"created_at":           sb.CreatedAt,
+		"updated_at":           sb.UpdatedAt,
+		"status":               sb.Status,
+		"stage":                stage,
+		"stage_message":        stageMessage,
+	}
+}
+
+// computeStage determines the current stage and message for a sandbox based
+// on its status and deployment state. The stage enum is: queued, cloning,
+// building, database, starting, health_check, live, failed.
+func (s *Server) computeStage(sb *db.Sandbox) (string, string) {
+	switch {
+	case sb.DestroyedAt != nil:
+		return "deleted", "sandbox has been destroyed"
+	case sb.Status == db.StatusQueued:
+		return "queued", "sandbox waiting for deployment"
+	case sb.Status == db.StatusBuilding:
+		return "building", "sandbox is being built"
+	case sb.Status == db.StatusRunning:
+		if sb.ContainerID == "" {
+			return "starting", "container starting"
+		}
+		svc, _ := servicesFromJSON(json.RawMessage(sb.ServicesOverride), "", analyze.Services{})
+		if svc.Postgres || svc.MySQL {
+			return "database", "provisioning sidecar database"
+		}
+		return "live", "sandbox is running"
+	case sb.Status == db.StatusHibernated:
+		return "hibernated", "sandbox is hibernated"
+	case sb.Status == db.StatusFailed:
+		return "failed", "build or deploy failed"
+	case sb.Status == db.StatusExpired:
+		return "expired", "sandbox lifetime expired"
+	default:
+		return "queued", "unknown state"
 	}
 }
 
@@ -440,7 +523,7 @@ func (s *Server) handleContainers(w http.ResponseWriter, r *http.Request) {
 
 	// If a specific container was requested, validate it.
 	if containerName != "" && !contains(validNames, containerName) {
-		writeErr(w, http.StatusBadRequest,
+		writeErr(w, http.StatusBadRequest, "validation_invalid_container",
 			fmt.Sprintf("container must be one of %v", validNames))
 		return
 	}
@@ -491,7 +574,7 @@ func (s *Server) handleContainers(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, cn := range serviceNames {
 		containers = append(containers, map[string]any{
-			"name":  cn,
+			"name":   cn,
 			"status": statusStr,
 			"health": healthStr,
 		})

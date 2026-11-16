@@ -16,10 +16,10 @@ import (
 // mishap in the editor sandbox must not clobber the user's real work. Pushing
 // directly to the original branch requires the caller to explicitly opt in.
 type commitPushRequest struct {
-	Message        string `json:"message"`
-	Branch         string `json:"branch"`           // optional target branch name (new)
-	DirectToOriginal bool `json:"direct_to_original"` // explicit opt-in toggle
-	Force          bool   `json:"force"`
+	Message          string `json:"message"`
+	Branch           string `json:"branch"`             // optional target branch name (new)
+	DirectToOriginal bool   `json:"direct_to_original"` // explicit opt-in toggle
+	Force            bool   `json:"force"`
 }
 
 // handleCommitPush stages the working tree, commits with the given message,
@@ -27,7 +27,7 @@ type commitPushRequest struct {
 func (s *Server) handleCommitPush(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.userFrom(r)
 	if !ok {
-		writeErr(w, http.StatusUnauthorized, "not signed in", "auth_unauthorized")
+		writeErr(w, http.StatusUnauthorized, "auth_unauthorized", "not signed in")
 		return
 	}
 	sb, ok := s.requireOwnedSandbox(w, r)
@@ -36,13 +36,13 @@ func (s *Server) handleCommitPush(w http.ResponseWriter, r *http.Request) {
 	}
 	s.touchSandbox(r.Context(), sb)
 	if sb.DestroyedAt != nil {
-		writeErr(w, http.StatusConflict, "sandbox is destroyed; nothing to commit", "nothing_to_commit")
+		writeErr(w, http.StatusConflict, "nothing_to_commit", "sandbox is destroyed; nothing to commit")
 		return
 	}
 
 	var req commitPushRequest
 	if err := decodeJSON(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "message is required", "validation_missing_param")
+		writeErr(w, http.StatusBadRequest, "validation_missing_param", "message is required")
 		return
 	}
 	message := req.Message
@@ -54,10 +54,10 @@ func (s *Server) handleCommitPush(w http.ResponseWriter, r *http.Request) {
 	hash, err := git.CommitAll(r.Context(), workDir, message)
 	if err != nil {
 		if errors.Is(err, git.ErrNoChanges) {
-			writeErr(w, http.StatusConflict, "nothing to commit (no changes in the sandbox working directory)")
+			writeErr(w, http.StatusConflict, "nothing_to_commit", "nothing to commit (no changes in the sandbox working directory)")
 			return
 		}
-		writeErr(w, http.StatusInternalServerError, "could not commit: "+err.Error())
+		writeErr(w, http.StatusInternalServerError, "commit_failed", "could not commit: "+err.Error())
 		return
 	}
 
@@ -71,13 +71,13 @@ func (s *Server) handleCommitPush(w http.ResponseWriter, r *http.Request) {
 
 	token, err := s.decryptUserToken(user.ID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not read GitHub credentials", "read_github_creds_failed")
+		writeErr(w, http.StatusInternalServerError, "read_github_creds_failed", "could not read GitHub credentials")
 		return
 	}
 
 	if err := git.Push(r.Context(), workDir, targetBranch, token, req.Force); err != nil {
 		s.logger.Warn("push failed", slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
-		writeErr(w, http.StatusBadGateway, "push failed: "+err.Error())
+		writeErr(w, http.StatusBadGateway, "push_failed", "push failed: "+err.Error())
 		return
 	}
 
@@ -86,9 +86,9 @@ func (s *Server) handleCommitPush(w http.ResponseWriter, r *http.Request) {
 		slog.String("branch", targetBranch), slog.String("hash", hash))
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"commit":  hash,
-		"branch":  targetBranch,
-		"direct":  req.DirectToOriginal,
+		"commit":    hash,
+		"branch":    targetBranch,
+		"direct":    req.DirectToOriginal,
 		"pushed_at": time.Now(),
 	})
 }

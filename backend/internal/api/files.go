@@ -39,7 +39,7 @@ func (s *Server) handleFileTree(w http.ResponseWriter, r *http.Request) {
 	}
 	root := filepath.Join(s.cfg.SandboxWorkDir, sb.Subdomain)
 	if _, err := os.Stat(root); os.IsNotExist(err) {
-		writeErr(w, http.StatusNotFound, "working directory not found (sandbox may still be building or was destroyed)")
+		writeErr(w, http.StatusNotFound, "workdir_not_found", "working directory not found (sandbox may still be building or was destroyed)")
 		return
 	}
 
@@ -68,7 +68,7 @@ func (s *Server) handleFileTree(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "could not walk working directory")
+		writeErr(w, http.StatusInternalServerError, "workdir_walk_failed", "could not walk working directory")
 		return
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
@@ -84,17 +84,17 @@ func (s *Server) handleFileContent(w http.ResponseWriter, r *http.Request) {
 	}
 	root, err := s.sandboxRoot(sb.ID)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "working directory not found", "working_dir_not_found_2")
+		writeErr(w, http.StatusNotFound, "working_dir_not_found_2", "working directory not found")
 		return
 	}
 	rel := r.URL.Query().Get("path")
 	data, info, err := readSandboxFile(root, rel)
 	if err != nil {
 		if errors.Is(err, errFileTooLarge) {
-			writeErr(w, http.StatusRequestEntityTooLarge, err.Error())
+			writeErr(w, http.StatusRequestEntityTooLarge, "file_too_large", err.Error())
 			return
 		}
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeErr(w, http.StatusBadRequest, "invalid_file_path", err.Error())
 		return
 	}
 	isBinary := isBinary(data)
@@ -128,7 +128,7 @@ var redeployLocks sync.Map
 func (s *Server) handleSaveFile(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.userFrom(r)
 	if !ok {
-		writeErr(w, http.StatusUnauthorized, "not signed in", "auth_unauthorized")
+		writeErr(w, http.StatusUnauthorized, "auth_unauthorized", "not signed in")
 		return
 	}
 	sb, ok := s.requireOwnedSandbox(w, r)
@@ -137,23 +137,23 @@ func (s *Server) handleSaveFile(w http.ResponseWriter, r *http.Request) {
 	}
 	s.touchSandbox(r.Context(), sb)
 	if sb.DestroyedAt != nil {
-		writeErr(w, http.StatusConflict, "sandbox is destroyed; nothing to edit", "nothing_to_edit")
+		writeErr(w, http.StatusConflict, "nothing_to_edit", "sandbox is destroyed; nothing to edit")
 		return
 	}
 	var req saveFileRequest
 	r.Body = http.MaxBytesReader(w, r.Body, 2*maxFileBytes)
 	if err := decodeJSON(r, &req); err != nil || req.Path == "" {
-		writeErr(w, http.StatusBadRequest, "path is required", "validation_missing_param")
+		writeErr(w, http.StatusBadRequest, "validation_missing_param", "path is required")
 		return
 	}
 
 	root, err := s.sandboxRoot(sb.ID)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "working directory not found (sandbox may still be building)")
+		writeErr(w, http.StatusNotFound, "workdir_not_found", "working directory not found (sandbox may still be building)")
 		return
 	}
 	if strings.HasPrefix(filepath.Clean(req.Path), ".git") {
-		writeErr(w, http.StatusBadRequest, "git internals are not editable", "git_editable")
+		writeErr(w, http.StatusBadRequest, "git_editable", "git internals are not editable")
 		return
 	}
 
@@ -161,7 +161,7 @@ func (s *Server) handleSaveFile(w http.ResponseWriter, r *http.Request) {
 	if req.IsBase64 {
 		data, err = base64.StdEncoding.DecodeString(req.Content)
 		if err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid base64 content", "invalid_base64")
+			writeErr(w, http.StatusBadRequest, "invalid_base64", "invalid base64 content")
 			return
 		}
 	} else {
@@ -169,10 +169,10 @@ func (s *Server) handleSaveFile(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := writeSandboxFile(root, req.Path, data); err != nil {
 		if errors.Is(err, errFileTooLarge) {
-			writeErr(w, http.StatusRequestEntityTooLarge, err.Error())
+			writeErr(w, http.StatusRequestEntityTooLarge, "file_too_large", err.Error())
 			return
 		}
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeErr(w, http.StatusBadRequest, "invalid_file_path", err.Error())
 		return
 	}
 	_ = s.store.RecordFileEdit(sb.ID, req.Path, user.ID)

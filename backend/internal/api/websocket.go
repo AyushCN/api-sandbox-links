@@ -70,6 +70,9 @@ type wsEvent struct {
 	NetworkRxBytes   *int64     `json:"network_rx_bytes,omitempty"`
 	NetworkTxBytes   *int64     `json:"network_tx_bytes,omitempty"`
 	RecordedAt       *time.Time `json:"recorded_at,omitempty"`
+
+	Stage    *string `json:"stage,omitempty"`
+	StageMsg *string `json:"stage_message,omitempty"`
 }
 
 // handleLogsWS streams a running sandbox container's stdout and stderr to the
@@ -153,6 +156,83 @@ func (s *Server) handleLogsWS(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+// logSnapshotWindow bounds how long GET /api/sandboxes/{id}/logs reads from the
+// container before returning. The Docker stream is a "follow" stream, so this
+// window is what turns it into a snapshot: long enough to drain the replayed
+// tail, short enough that a polling client gets an answer promptly.
+const logSnapshotWindow = 1500 * time.Millisecond
+
+// handleLogs serves GET /api/sandboxes/{id}/logs: a one-shot snapshot of the
+// running container's stdout and stderr for clients that poll instead of
+// holding the /logs/ws socket open. It returns the same available/message
+// contract as the websocket's terminal frames so either path can render the
+// same panel.
+func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
+	sb, ok := s.requireOwnedSandbox(w, r)
+	if !ok {
+		return
+	}
+	if reason := unavailableReason(sb); reason != "" {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"available": false,
+			"status":    string(sb.Status),
+			"message":   reason,
+		})
+		return
+	}
+	s.touchSandbox(r.Context(), sb)
+
+	ctx, cancel := context.WithTimeout(r.Context(), logSnapshotWindow)
+	defer cancel()
+
+	stream, err := s.orch.StreamContainerLogs(ctx, sb.ContainerID)
+	if err != nil {
+		s.logger.Warn("logs snapshot: cannot open container log stream",
+			slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
+		writeJSON(w, http.StatusOK, map[string]any{
+			"available": false,
+			"status":    string(sb.Status),
+			"message":   "could not open the container log stream",
+		})
+		return
+	}
+	defer func() { _ = stream.Close() }()
+
+	var mu sync.Mutex
+	var buf strings.Builder
+	var pumps sync.WaitGroup
+	for _, reader := range []io.ReadCloser{stream.Stdout(), stream.Stderr()} {
+		pumps.Add(1)
+		go func(reader io.ReadCloser) {
+			defer pumps.Done()
+			br := bufio.NewReaderSize(reader, 64*1024)
+			for {
+				line, truncated, err := readLogLine(br, maxLogLineBytes)
+				if err != nil {
+					return
+				}
+				if len(line) == 0 && !truncated {
+					continue
+				}
+				mu.Lock()
+				buf.Write(line)
+				buf.WriteByte('\n')
+				mu.Unlock()
+			}
+		}(reader)
+	}
+
+	<-ctx.Done()
+	_ = stream.Close()
+	pumps.Wait()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"available": true,
+		"status":    string(sb.Status),
+		"output":    buf.String(),
+	})
 }
 
 // pumpLogLines forwards one demultiplexed stream to the browser line by line.

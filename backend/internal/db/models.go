@@ -70,6 +70,23 @@ type User struct {
 	CreatedAt   time.Time `gorm:"default:now()"`
 }
 
+// APIToken is a personal access token for the JSON API. TokenHash is the
+// SHA-256 of the plaintext secret, which itself is never stored; Prefix is the
+// short non-secret lead-in shown in the list view.
+type APIToken struct {
+	ID         string    `gorm:"type:uuid;primaryKey"`
+	UserID     string    `gorm:"type:uuid;not null"`
+	Name       string    `gorm:"not null;default:''"`
+	TokenHash  string    `gorm:"uniqueIndex;not null"`
+	Prefix     string    `gorm:"not null;default:''"`
+	CreatedAt  time.Time `gorm:"default:now()"`
+	LastUsedAt *time.Time
+	RevokedAt  *time.Time
+}
+
+// TableName keeps GORM from pluralizing to "api_token".
+func (APIToken) TableName() string { return "api_tokens" }
+
 // Repository is a GitHub repo a user has connected at least once.
 type Repository struct {
 	ID            string    `gorm:"type:uuid;primaryKey"`
