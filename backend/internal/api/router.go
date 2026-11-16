@@ -186,7 +186,9 @@ func (s *Server) Router() http.Handler {
 			pr.Get("/{id}/files", s.handleFileTree)
 			pr.Get("/{id}/file", s.handleFileContent)
 			pr.Put("/{id}/file", s.handleSaveFile)
+			pr.Post("/{id}/files/delete", s.handleDeleteFile)
 			pr.Post("/{id}/commit", s.handleCommitPush)
+			pr.Post("/{id}/push", s.handlePush)
 		})
 
 		// Live channels. Both share authorizeSandboxAccess and the same

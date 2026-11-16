@@ -194,6 +194,75 @@ func (s *Server) handleSaveFile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"saved": true, "path": req.Path, "redeploying": true})
 }
 
+// deleteFileRequest is the body of POST /api/sandboxes/{id}/files/delete.
+type deleteFileRequest struct {
+	Path string `json:"path"`
+}
+
+// handleDeleteFile removes a file or directory from the sandbox's working
+// directory and schedules a redeploy, mirroring the save-file flow so the
+// container reflects the change.
+func (s *Server) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
+	user, ok := s.userFrom(r)
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, "auth_unauthorized", "not signed in")
+		return
+	}
+	sb, ok := s.requireOwnedSandbox(w, r)
+	if !ok {
+		return
+	}
+	s.touchSandbox(r.Context(), sb)
+	if sb.DestroyedAt != nil {
+		writeErr(w, http.StatusConflict, "nothing_to_edit", "sandbox is destroyed; nothing to edit")
+		return
+	}
+	var req deleteFileRequest
+	r.Body = http.MaxBytesReader(w, r.Body, maxFileBytes)
+	if err := decodeJSON(r, &req); err != nil || strings.TrimSpace(req.Path) == "" {
+		writeErr(w, http.StatusBadRequest, "validation_missing_param", "path is required")
+		return
+	}
+	root, err := s.sandboxRoot(sb.ID)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "workdir_not_found", "working directory not found (sandbox may still be building)")
+		return
+	}
+	if strings.HasPrefix(filepath.Clean(req.Path), ".git") {
+		writeErr(w, http.StatusBadRequest, "git_editable", "git internals are not editable")
+		return
+	}
+	full, err := safeJoin(root, req.Path)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid_file_path", err.Error())
+		return
+	}
+	if _, err := os.Lstat(full); err != nil {
+		writeErr(w, http.StatusNotFound, "file_not_found", "no such file or directory")
+		return
+	}
+	if err := os.RemoveAll(full); err != nil {
+		s.logger.Warn("delete file failed", slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
+		writeErr(w, http.StatusInternalServerError, "delete_failed", "could not delete the file")
+		return
+	}
+	_ = s.store.RecordFileEdit(sb.ID, req.Path, user.ID)
+
+	_, already := redeployLocks.LoadOrStore(sb.ID, struct{}{})
+	if !already {
+		go func() {
+			defer redeployLocks.Delete(sb.ID)
+			ctx, cancel := context.WithTimeout(context.Background(), orchestrator.DeployTimeout)
+			defer cancel()
+			if err := s.deployer.DeploySandbox(ctx, sb, orchestrator.DeployOptions{Trigger: db.TriggerSaveRedeploy}); err != nil {
+				s.logger.Warn("delete redeploy failed", slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
+			}
+		}()
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "path": req.Path, "redeploying": true})
+}
+
 // sandboxRoot resolves the sandbox's on-disk working directory.
 func (s *Server) sandboxRoot(sandboxID string) (string, error) {
 	sb, err := s.store.GetSandbox(sandboxID)

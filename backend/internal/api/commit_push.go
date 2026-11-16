@@ -93,6 +93,56 @@ func (s *Server) handleCommitPush(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// pushRequest is the body of POST /{id}/push. Both fields are optional.
+type pushRequest struct {
+	Branch string `json:"branch"`
+	Force  bool   `json:"force"`
+}
+
+// handlePush pushes the sandbox's current HEAD to GitHub without creating a
+// commit. It backs the frontend's standalone "Push" action, which runs after
+// the user has already committed their edits.
+func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
+	user, ok := s.userFrom(r)
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, "auth_unauthorized", "not signed in")
+		return
+	}
+	sb, ok := s.requireOwnedSandbox(w, r)
+	if !ok {
+		return
+	}
+	s.touchSandbox(r.Context(), sb)
+	if sb.DestroyedAt != nil {
+		writeErr(w, http.StatusConflict, "nothing_to_commit", "sandbox is destroyed; nothing to push")
+		return
+	}
+
+	var req pushRequest
+	_ = decodeJSON(r, &req) // body is optional
+	branch := req.Branch
+	if branch == "" {
+		branch = sb.BranchName
+	}
+
+	token, err := s.decryptUserToken(user.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "read_github_creds_failed", "could not read GitHub credentials")
+		return
+	}
+
+	workDir := filepath.Join(s.cfg.SandboxWorkDir, sb.Subdomain)
+	if err := git.Push(r.Context(), workDir, branch, token, req.Force); err != nil {
+		s.logger.Warn("push failed", slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
+		writeErr(w, http.StatusBadGateway, "push_failed", "push failed: "+err.Error())
+		return
+	}
+
+	_ = s.store.MarkFileEditsPushed(sb.ID)
+	s.logger.Info("pushed", slog.String("sandbox", sb.ID), slog.String("branch", branch))
+	writeJSON(w, http.StatusOK, map[string]any{"branch": branch, "pushed_at": time.Now()})
+}
+
 // decryptUserToken loads and decrypts the user's stored GitHub token.
 func (s *Server) decryptUserToken(userID string) (string, error) {
 	u, err := s.store.GetUser(userID)
